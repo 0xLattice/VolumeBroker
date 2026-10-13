@@ -24,6 +24,7 @@ Retention never substitutes for publication.
 | VOLUME-017 | Corrupt bytes fail CID validation on read and are not served; nothing is flagged or deleted, what is retained is unchanged, and a valid re-store overwrites them. |
 | VOLUME-018 | SQLite WAL with `synchronous=FULL` is the durable-commit boundary: a returned store survives a crash, so a later advance never names lost content. |
 | VOLUME-019 | A batched CID read applies the same complete-owner serve gate, CID validation and local-to-far precedence as scalar reads. |
+| VOLUME-020 | `releaseRetainedRoots` removes the named roots from one scope, then each of those Volumes no scope retains and the CAS rows that leaves unowned, in one transaction. It touches no Volume it was not given, and its work is in the roots named. |
 
 A read never writes: corruption only hides the corrupt bytes from readers, so a
 database error or a corrupt leaf can never shrink what a retained root keeps.

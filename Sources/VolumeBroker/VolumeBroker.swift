@@ -48,6 +48,18 @@ public protocol RetainedRootMergeBroker: RetainedRootBroker {
     func mergeRetainedRoots(scope: String, roots: [String]) async throws
 }
 
+/// Optional retained-root surface for brokers that can let go of named roots
+/// and reclaim them without a pass over the whole store.
+public protocol RetainedRootReleaseBroker: RetainedRootMergeBroker {
+    /// Atomically remove `roots` from `scope`, then remove each of those
+    /// Volumes that no scope retains and every CAS row that leaves unowned.
+    /// A root the scope does not hold is not an error. Nothing but the
+    /// Volumes named is touched: content stored and not yet retained stays
+    /// unless it is named here. Returns the number of Volumes removed.
+    @discardableResult
+    func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int
+}
+
 public extension VolumeBroker {
     func store(volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])

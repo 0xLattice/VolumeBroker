@@ -79,6 +79,74 @@ struct RetainedRootIndex {
         }
     }
 
+    /// `roots` leave `scope`; each of them no scope then retains is deleted
+    /// (its membership cascades) with the CAS rows it leaves unowned, in one
+    /// transaction on the serial write connection. The work is in the roots
+    /// named, not in the size of the store.
+    func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int {
+        let canonicalRoots = try Self.canonicalRoots(roots)
+        guard !scope.isEmpty else {
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
+        }
+
+        return try await connection.write {
+            try connection.transaction {
+                for root in canonicalRoots {
+                    try connection.execBind("DELETE FROM retained_roots WHERE scope=?1 AND root=?2") { stmt in
+                        sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
+                        sqlite3_bind_text(stmt, 2, root, -1, SQLITE_TRANSIENT_SHIM)
+                    }
+                }
+                var removed = 0
+                for root in canonicalRoots {
+                    let members = try memberCIDs(root: root)
+                    try connection.execBind("""
+                        DELETE FROM volume_metadata
+                        WHERE root=?1 AND NOT EXISTS (SELECT 1 FROM retained_roots WHERE root=?1)
+                        """) { stmt in
+                        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+                    }
+                    guard sqlite3_changes(connection.db) > 0 else { continue }
+                    removed += 1
+                    for cid in members {
+                        try connection.execBind("""
+                            DELETE FROM cas_data
+                            WHERE cid=?1 AND NOT EXISTS (SELECT 1 FROM volume_entries WHERE cid=?1)
+                            """) { stmt in
+                            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+                        }
+                    }
+                }
+                return removed
+            }
+        }
+    }
+
+    /// On the write connection, inside the caller's transaction.
+    private func memberCIDs(root: String) throws -> [String] {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(connection.db, "SELECT cid FROM volume_entries WHERE root=?1", -1, &stmt, nil) == SQLITE_OK,
+              let stmt,
+              sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+        }
+        var result: [String] = []
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                guard let ptr = sqlite3_column_text(stmt, 0) else {
+                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+                }
+                result.append(String(cString: ptr))
+            case SQLITE_DONE:
+                return result
+            default:
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+            }
+        }
+    }
+
     func retainedRoots(scope: String) async throws -> [String] {
         guard !scope.isEmpty else { return [] }
         return try await connection.read {

@@ -2,7 +2,7 @@ import Foundation
 
 /// In-memory twin of `DiskBroker` with identical store, retention, and sweep
 /// semantics.
-public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
+public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker {
     public let near: (any VolumeBroker)?
     public let far: (any VolumeBroker)?
 
@@ -172,6 +172,24 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
         lock.withWriteLock {
             let retained = Set(state.retainedRoots.values.joined())
             let dead = state.membersByRoot.keys.filter { !retained.contains($0) }
+            for root in dead {
+                Self.removeVolume(root: root, state: &state)
+            }
+            return dead.count
+        }
+    }
+
+    @discardableResult
+    public func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int {
+        let canonicalRoots = try Self.canonicalRetainedRoots(roots)
+        guard !scope.isEmpty else {
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
+        }
+
+        return lock.withWriteLock {
+            state.retainedRoots[scope]?.subtract(canonicalRoots)
+            let retained = Set(state.retainedRoots.values.joined())
+            let dead = canonicalRoots.filter { state.membersByRoot[$0] != nil && !retained.contains($0) }
             for root in dead {
                 Self.removeVolume(root: root, state: &state)
             }

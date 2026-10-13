@@ -36,7 +36,7 @@ struct RetentionTests {
         return SerializedVolume(root: cid(label), entries: entries)
     }
 
-    private static func broker(_ kind: Kind) throws -> any RetainedRootMergeBroker {
+    private static func broker(_ kind: Kind) throws -> any RetainedRootReleaseBroker {
         switch kind {
         case .memory:
             return MemoryBroker()
@@ -101,6 +101,46 @@ struct RetentionTests {
             #expect(await broker.hasVolume(root: Self.cid(root)) == false, "\(root)")
         }
         #expect(await broker.fetchDataLocal(cid: Self.cid("old-leaf")) == nil)
+    }
+
+    @Test(arguments: Kind.allCases)
+    func releasingRemovesTheNamedVolumesNoScopeRetainsAndNothingElse(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([
+            Self.volume("gone", ["gone-leaf", "shared-leaf"]),
+            Self.volume("elsewhere", ["elsewhere-leaf"]),
+            Self.volume("kept", ["shared-leaf"]),
+            Self.volume("stray", ["stray-leaf"]),
+        ])
+        try await broker.advanceRetainedRoots(scope: "a", roots: ["gone", "elsewhere", "kept"].map(Self.cid))
+        try await broker.advanceRetainedRoots(scope: "b", roots: [Self.cid("elsewhere")])
+
+        // `absent` was never stored and `stray` is in no scope: neither is an error.
+        let removed = try await broker.releaseRetainedRoots(
+            scope: "a", roots: ["gone", "elsewhere", "absent"].map(Self.cid))
+
+        #expect(removed == 1)
+        #expect(try await broker.retainedRoots(scope: "a") == [Self.cid("kept")])
+        #expect(try await broker.retainedRoots(scope: "b") == [Self.cid("elsewhere")])
+        #expect(await broker.hasVolume(root: Self.cid("gone")) == false)
+        #expect(await broker.fetchDataLocal(cid: Self.cid("gone-leaf")) == nil)
+        // Another scope still retains it.
+        #expect(await broker.hasVolume(root: Self.cid("elsewhere")))
+        // Bytes a surviving Volume owns stay.
+        #expect(await broker.fetchDataLocal(cid: Self.cid("shared-leaf")) == Data("shared-leaf".utf8))
+        // Unlike a sweep, content that was not named is not touched, retained or not.
+        #expect(await broker.hasVolume(root: Self.cid("stray")))
+        #expect(await broker.hasVolume(root: Self.cid("kept")))
+    }
+
+    @Test(arguments: Kind.allCases)
+    func releasingAVolumeInNoScopeRemovesIt(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("stray", ["stray-leaf"])])
+
+        #expect(try await broker.releaseRetainedRoots(scope: "a", roots: [Self.cid("stray")]) == 1)
+        #expect(await broker.hasVolume(root: Self.cid("stray")) == false)
+        #expect(await broker.fetchDataLocal(cid: Self.cid("stray-leaf")) == nil)
     }
 
     @Test(arguments: Kind.allCases)
@@ -181,7 +221,7 @@ struct RetentionTests {
     }
 
     private static func observe(
-        _ broker: any RetainedRootMergeBroker,
+        _ broker: any RetainedRootReleaseBroker,
         result: String,
         universe: [SerializedVolume],
         cids: [String]
@@ -200,7 +240,7 @@ struct RetentionTests {
     }
 
     private static func apply(
-        _ broker: any RetainedRootMergeBroker,
+        _ broker: any RetainedRootReleaseBroker,
         op: Int,
         roots: [String],
         batch: [SerializedVolume],
@@ -211,6 +251,7 @@ struct RetentionTests {
             case 0: try await broker.storeVolumesLocal(batch); return "stored"
             case 1: try await broker.advanceRetainedRoots(scope: scope, roots: roots); return "advanced"
             case 2: try await broker.mergeRetainedRoots(scope: scope, roots: roots); return "merged"
+            case 3: return "released \(try await broker.releaseRetainedRoots(scope: scope, roots: roots))"
             default: return "swept \(try await broker.sweep())"
             }
         } catch {
@@ -227,7 +268,7 @@ struct RetentionTests {
         let disk = try Self.broker(.disk)
 
         for step in 0..<60 {
-            let op = Int.random(in: 0..<4, using: &rng)
+            let op = Int.random(in: 0..<5, using: &rng)
             let scope = Self.scopes.randomElement(using: &rng)!
             let batch = (0..<Int.random(in: 1...3, using: &rng)).map { _ in
                 universe.randomElement(using: &rng)!
