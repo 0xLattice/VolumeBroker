@@ -254,6 +254,53 @@ struct DiskBrokerTests {
         #expect(await broker.hasVolume(root: drop) == false)
     }
 
+    /// What a node reads at start: the scopes a previous process left, and
+    /// only those, with a release it committed still in force.
+    @Test func scopesAndTheirListingSurviveReopen() async throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        do {
+            let broker = try DiskBroker(path: location.path)
+            try await broker.storeVolumesLocal([payload("one"), payload("two"), payload("three")])
+            try await broker.mergeRetainedRoots(scope: "chain:body:one", roots: [cid("one")])
+            try await broker.mergeRetainedRoots(scope: "chain:body:two", roots: [cid("two")])
+            try await broker.mergeRetainedRoots(scope: "chain:body:three", roots: [cid("three")])
+            try await broker.releaseRetainedRoots(scope: "chain:body:two", roots: [cid("two")])
+        }
+
+        let reopened = try DiskBroker(path: location.path)
+        #expect(try await reopened.retainedScopes(prefix: "chain:body:") == ["chain:body:one", "chain:body:three"])
+        #expect(try await reopened.retainedRoots(scope: "chain:body:one") == [cid("one")])
+        #expect(await reopened.hasVolume(root: cid("two")) == false)
+        #expect(await reopened.hasVolume(root: cid("three")))
+    }
+
+    /// A listing is one snapshot: with a writer that always leaves one of
+    /// two scopes retaining something, no listing sees neither.
+    @Test func aListingUnderAWriterIsOneCommittedState() async throws {
+        let broker = try tempDB()
+        try await broker.store(volume: payload("held"))
+        try await broker.mergeRetainedRoots(scope: "p:b", roots: [cid("held")])
+        let held = cid("held")
+        let writer = Task {
+            for _ in 0..<400 {
+                try await broker.mergeRetainedRoots(scope: "p:y", roots: [held])
+                try await broker.releaseRetainedRoots(scope: "p:b", roots: [held])
+                try await broker.mergeRetainedRoots(scope: "p:b", roots: [held])
+                try await broker.releaseRetainedRoots(scope: "p:y", roots: [held])
+            }
+        }
+        var listings = 0
+        while !writer.isCancelled, listings < 4_000 {
+            let scopes = try await broker.retainedScopes(prefix: "p:")
+            #expect(!scopes.isEmpty)
+            #expect(scopes.allSatisfy { $0 == "p:b" || $0 == "p:y" })
+            listings += 1
+        }
+        try await writer.value
+        #expect(await broker.hasVolume(root: held))
+    }
+
     @Test func persistedRetentionSurvivesReopenThenControlsSweep() async throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
