@@ -2,7 +2,7 @@ import Foundation
 
 /// In-memory twin of `DiskBroker` with identical store, retention, and sweep
 /// semantics.
-public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
+public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker {
     public let near: (any VolumeBroker)?
     public let far: (any VolumeBroker)?
 
@@ -179,10 +179,34 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
         }
     }
 
+    @discardableResult
+    public func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int {
+        let canonicalRoots = try Self.canonicalRetainedRoots(roots)
+        guard !scope.isEmpty else {
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
+        }
+
+        return lock.withWriteLock {
+            state.retainedRoots[scope]?.subtract(canonicalRoots)
+            let dead = canonicalRoots.filter { root in
+                state.membersByRoot[root] != nil && !state.retainedRoots.values.contains { $0.contains(root) }
+            }
+            for root in dead {
+                Self.removeVolume(root: root, state: &state)
+            }
+            return dead.count
+        }
+    }
+
     private static func canonicalRetainedRoots(_ roots: [String]) throws -> [String] {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain empty strings")
+        }
+        // SQLite reads a bound string up to its first NUL, so such a name
+        // would stand for another.
+        if unique.contains(where: { $0.contains("\0") }) {
+            throw BrokerError.invalidRetainedRoots("roots must not contain NUL")
         }
         return unique.sorted()
     }

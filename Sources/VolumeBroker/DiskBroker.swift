@@ -6,12 +6,12 @@ import Foundation
 /// it owns no SQL itself. The layers are:
 ///   - `SQLiteConnection`  — connection/PRAGMA/schema + serialised read/write access.
 ///   - `CASVolumeStore`    — content-addressed volume store (store/fetch/has).
-///   - `RetainedRootIndex` — named retained-root sets and sweep.
+///   - `RetainedRootIndex` — named retained-root sets, release, and sweep.
 ///
 /// Durability: the write connection runs WAL with `synchronous=FULL`, so every
 /// committed transaction is fsynced to the WAL before `COMMIT` returns. A
 /// `store` that returns has survived any later crash; no separate sync exists.
-public final class DiskBroker: @unchecked Sendable, RetainedRootMergeBroker {
+public final class DiskBroker: @unchecked Sendable, RetainedRootReleaseBroker {
     public let near: (any VolumeBroker)?
     public let far: (any VolumeBroker)?
 
@@ -71,6 +71,11 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootMergeBroker {
     @discardableResult
     public func sweep() async throws -> Int {
         try await retainedRoots.sweep()
+    }
+
+    @discardableResult
+    public func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int {
+        try await retainedRoots.releaseRetainedRoots(scope: scope, roots: roots)
     }
 
     public func checkpoint() async {

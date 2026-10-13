@@ -81,6 +81,14 @@ Volume owns, in one transaction. It has no grace window: content stored but not
 yet retained is swept, and a later advance naming it is refused. Callers store,
 then advance, and sweep only between their own commits.
 
+```swift
+let removed = try await disk.releaseRetainedRoots(scope: "canonical", roots: [oldRoot])
+```
+
+`releaseRetainedRoots` takes roots out of a scope and removes those of them no
+scope retains, with the CAS rows that leaves unowned. Its work is in the roots
+named, not in the size of the store, and it touches nothing else.
+
 ## Implementations
 
 - `MemoryBroker` is the in-memory twin with identical retention semantics.
