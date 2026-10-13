@@ -215,8 +215,9 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
             throw BrokerError.invalidRetainedRoots("scope must not be empty")
         }
         // SQLite reads a bound string up to its first NUL, so such a name
-        // would stand for another scope.
-        guard !scope.contains("\0") else {
+        // would stand for another scope. By its bytes: a NUL under a
+        // combining mark is one Character that is not "\0".
+        guard !scope.utf8.contains(0) else {
             throw BrokerError.invalidRetainedRoots("scope must not contain NUL")
         }
     }
@@ -228,7 +229,7 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         }
         // SQLite reads a bound string up to its first NUL, so such a name
         // would stand for another.
-        if unique.contains(where: { $0.contains("\0") }) {
+        if unique.contains(where: { $0.utf8.contains(0) }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain NUL")
         }
         return unique.sorted()

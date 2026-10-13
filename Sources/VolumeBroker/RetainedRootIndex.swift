@@ -148,7 +148,7 @@ struct RetainedRootIndex {
     /// in-memory broker alike.
     func retainedScopes(prefix: String) async throws -> [String] {
         // No scope's name holds a NUL, so none starts with such a prefix.
-        guard !prefix.contains("\0") else { return [] }
+        guard !prefix.utf8.contains(0) else { return [] }
         return try await connection.read {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
@@ -186,7 +186,7 @@ struct RetainedRootIndex {
     }
 
     func retainedRoots(scope: String) async throws -> [String] {
-        guard !scope.isEmpty, !scope.contains("\0") else { return [] }
+        guard !scope.isEmpty, !scope.utf8.contains(0) else { return [] }
         return try await connection.read {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
@@ -221,8 +221,9 @@ struct RetainedRootIndex {
             throw BrokerError.invalidRetainedRoots("scope must not be empty")
         }
         // SQLite reads a bound string up to its first NUL, so such a name
-        // would stand for another scope.
-        guard !scope.contains("\0") else {
+        // would stand for another scope. By its bytes: a NUL under a
+        // combining mark is one Character that is not "\0".
+        guard !scope.utf8.contains(0) else {
             throw BrokerError.invalidRetainedRoots("scope must not contain NUL")
         }
     }
@@ -234,7 +235,7 @@ struct RetainedRootIndex {
         }
         // SQLite reads a bound string up to its first NUL, so such a name
         // would stand for another.
-        if unique.contains(where: { $0.contains("\0") }) {
+        if unique.contains(where: { $0.utf8.contains(0) }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain NUL")
         }
         return unique.sorted()

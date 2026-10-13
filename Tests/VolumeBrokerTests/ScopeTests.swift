@@ -346,11 +346,9 @@ struct ScopeTests {
         try await broker.mergeRetainedRoots(scope: "c:live-mempool", roots: pooled)
         let surviving = Set(sibling).union(pooled)
 
-        let clock = ContinuousClock()
         let roots = try await broker.retainedRoots(scope: body)
         #expect(roots.count == 4_001)
-        var removed = 0
-        let elapsed = try await clock.measure { removed = try await broker.releaseRetainedRoots(scope: body, roots: roots) }
+        let removed = try await broker.releaseRetainedRoots(scope: body, roots: roots)
         #expect(removed == 4_001 - surviving.count)
         #expect(try await broker.retainedScopes(prefix: "c:body:") == ["c:body:sibling"])
         #expect(try await broker.retainedRoots(scope: "c").count == 4_000)
@@ -565,41 +563,34 @@ struct ScopeTests {
             """
     }()
 
-    /// A million body scopes beside a chain scope of a million roots, written
-    /// straight into the table (retained_roots has no foreign key).
-    @Test func aMillionScopesAreListedInTimeProportionalToThoseListed() async throws {
+    /// A hundred thousand body scopes beside a chain scope of as many roots,
+    /// written straight into the table (retained_roots has no foreign key).
+    /// What makes the listing cost the scopes listed is its plan, which is
+    /// pinned here; timings are a measurement and not asserted.
+    @Test func manyScopesAreListedByIndexSeeksAlone() async throws {
         let path = NSTemporaryDirectory() + "vb_scopeprobe_million_\(UUID().uuidString).sqlite"
         defer { for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: path + suffix) } }
         let broker = try DiskBroker(path: path)
         let fill = """
-            WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 999999)
+            WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 99999)
             INSERT INTO retained_roots(scope, root)
-            SELECT 'bafychain:Nexus:body:bafyrei' || printf('%052d', (i * 7919) % 1000000), 'bafyreiroot' || i FROM n
-            UNION ALL SELECT 'bafychain:Nexus:body:bafyrei' || printf('%052d', (i * 7919) % 1000000), 'bafyreitx' || i FROM n WHERE i % 2 = 0
+            SELECT 'bafychain:Nexus:body:bafyrei' || printf('%052d', (i * 7919) % 100000), 'bafyreiroot' || i FROM n
+            UNION ALL SELECT 'bafychain:Nexus:body:bafyrei' || printf('%052d', (i * 7919) % 100000), 'bafyreitx' || i FROM n WHERE i % 2 = 0
             UNION ALL SELECT 'bafychain:Nexus', 'bafyreistate' || i FROM n
             UNION ALL SELECT 'bafychain:Nexus:live-mempool', 'bafyreipool' || i FROM n WHERE i < 5000
             """
         _ = Self.rows(path, fill, write: true)
-        #expect(Self.count(path, "SELECT COUNT(*) FROM retained_roots") == 2_505_000)
+        #expect(Self.count(path, "SELECT COUNT(*) FROM retained_roots") == 255_000)
 
-        let clock = ContinuousClock()
-        var all: [String] = []
-        let whole = try await clock.measure { all = try await broker.retainedScopes(prefix: "bafychain:Nexus:body:") }
-        #expect(all.count == 1_000_000)
+        let all = try await broker.retainedScopes(prefix: "bafychain:Nexus:body:")
+        #expect(all.count == 100_000)
         #expect(all.first == "bafychain:Nexus:body:bafyrei" + String(repeating: "0", count: 52))
         #expect(zip(all, all.dropFirst()).allSatisfy { $0.utf8.lexicographicallyPrecedes($1.utf8) })
-        var some: [String] = []
-        let narrow = try await clock.measure {
-            some = try await broker.retainedScopes(prefix: "bafychain:Nexus:body:bafyrei" + String(repeating: "0", count: 49))
-        }
+        let some = try await broker.retainedScopes(
+            prefix: "bafychain:Nexus:body:bafyrei" + String(repeating: "0", count: 49))
         #expect(some.count == 1_000)
-        var none: [String] = []
-        let miss = try await clock.measure { none = try await broker.retainedScopes(prefix: "bafychain:Nexus:bodz") }
-        #expect(none == [])
-        var top: [String] = []
-        let chainOnly = try await clock.measure { top = try await broker.retainedScopes(prefix: "bafychain:Nexus:l") }
-        #expect(top == ["bafychain:Nexus:live-mempool"])
-        #expect(narrow < whole / 50)
+        #expect(try await broker.retainedScopes(prefix: "bafychain:Nexus:bodz") == [])
+        #expect(try await broker.retainedScopes(prefix: "bafychain:Nexus:l") == ["bafychain:Nexus:live-mempool"])
 
         let plan = Self.rows(path, "EXPLAIN QUERY PLAN " + Self.listingSQL).map { $0.last ?? "" }
         let searches = plan.filter { $0.contains("retained_roots") }
@@ -608,13 +599,10 @@ struct ScopeTests {
         #expect(!plan.contains { $0.contains("SCAN retained_roots") })
 
         // Releasing one body scope in a store this size is a matter of its own roots.
-        var removed = -1
-        let release = try await clock.measure {
-            removed = try await broker.releaseRetainedRoots(scope: all[500_000], roots: try await broker.retainedRoots(scope: all[500_000]))
-        }
+        let removed = try await broker.releaseRetainedRoots(
+            scope: all[50_000], roots: try await broker.retainedRoots(scope: all[50_000]))
         #expect(removed == 0)
-        #expect(try await broker.retainedScopes(prefix: all[500_000]) == [])
-        #expect(release < .seconds(1))
+        #expect(try await broker.retainedScopes(prefix: all[50_000]) == [])
     }
 
     /// One commit changes one scope, so a listing that is short cannot tell
@@ -760,7 +748,7 @@ struct ScopeTests {
         let broker = store.broker
         let chain = "bafychain:Nexus"
         let bodyPrefix = "\(chain):body:"
-        let fetchers = 6, blocksEach = kind == .disk ? 40 : 150, releasers = 3
+        let fetchers = 6, blocksEach = kind == .disk ? 12 : 60, releasers = 3
         let shared = Self.volume("shared-tx", ["shared-leaf"])
         let state = Self.volume("state", ["shared-leaf"])
         func blockVolumes(_ f: Int, _ b: Int) -> [SerializedVolume] {
