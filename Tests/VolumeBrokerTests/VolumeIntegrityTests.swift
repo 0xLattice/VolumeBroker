@@ -703,7 +703,7 @@ final class VolumeIntegrityTests: XCTestCase {
         if let childPath = ProcessInfo.processInfo.environment[childPathKey] {
             let broker = try DiskBroker(path: childPath)
             try await broker.storeVolumesLocal([old, shared])
-            try await broker.advanceRetainedRoots(scope: "s", roots: [old.root])
+            try await broker.advanceRetainedRoots(scope: "s", roots: [old.root, shared.root])
             try await broker.store(volume: new)
             Darwin._exit(0)
         }
@@ -721,7 +721,7 @@ final class VolumeIntegrityTests: XCTestCase {
 
         let reopened = try DiskBroker(path: path)
         let retained = try await reopened.retainedRoots(scope: "s")
-        XCTAssertEqual(retained, [old.root])
+        XCTAssertEqual(Set(retained), [old.root, shared.root])
         let newStored = await reopened.hasVolume(root: new.root)
         XCTAssertTrue(newStored, "a returned store is durable")
 

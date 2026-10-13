@@ -170,27 +170,13 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
     @discardableResult
     public func sweep() async throws -> Int {
         lock.withWriteLock {
-            let live = Self.liveRoots(state: state)
-            let dead = state.membersByRoot.keys.filter { !live.contains($0) }
+            let retained = Set(state.retainedRoots.values.joined())
+            let dead = state.membersByRoot.keys.filter { !retained.contains($0) }
             for root in dead {
                 Self.removeVolume(root: root, state: &state)
             }
             return dead.count
         }
-    }
-
-    /// Mirrors `RetainedRootIndex.liveRootsCTE`: retained roots, plus every
-    /// stored Volume root that is a member of a live, complete Volume.
-    private static func liveRoots(state: State) -> Set<String> {
-        var live = Set<String>()
-        var frontier = Array(state.retainedRoots.values.joined())
-        while let root = frontier.popLast() {
-            guard live.insert(root).inserted,
-                  isComplete(root: root, state: state),
-                  let members = state.membersByRoot[root] else { continue }
-            frontier.append(contentsOf: members.filter { state.membersByRoot[$0] != nil })
-        }
-        return live
     }
 
     private static func canonicalRetainedRoots(_ roots: [String]) throws -> [String] {

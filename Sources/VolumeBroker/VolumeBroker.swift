@@ -22,10 +22,9 @@ public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
 
 /// Retention surface: named scopes of retained Volume roots.
 ///
-/// A Volume root is live if a scope retains it, or if it is a member CID of a
-/// live, complete Volume and is itself a stored Volume root. Liveness is
-/// recursive through Volume membership. `sweep` removes every Volume that is
-/// not live and then every CAS row no surviving Volume owns.
+/// A Volume is kept if a scope retains its root, and only then: retaining a
+/// root does not keep a Volume nested under it. `sweep` removes every Volume
+/// no scope retains and then every CAS row no surviving Volume owns.
 ///
 /// Storing does not retain. Content stored but not yet named by a retained
 /// root is removed by the next `sweep`; a later advance naming it is then
@@ -37,7 +36,7 @@ public protocol RetainedRootBroker: VolumeBroker {
     /// older snapshot drops every root merged after that snapshot.
     func advanceRetainedRoots(scope: String, roots: [String]) async throws
     func retainedRoots(scope: String) async throws -> [String]
-    /// Remove every unreachable Volume and unowned CAS row in one atomic step.
+    /// Remove every unretained Volume and unowned CAS row in one atomic step.
     /// Returns the number of Volumes removed.
     @discardableResult
     func sweep() async throws -> Int

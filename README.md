@@ -13,8 +13,8 @@ about chains.
 - A Volume is visible only after its complete, CID-valid entry set commits.
 - Valid CID bytes and Volume membership are immutable.
 - Reads may fall through `local -> near -> far`; writes target one broker.
-- Retained roots keep everything reachable from them through Volume membership;
-  `sweep` removes the rest.
+- A retained root keeps its own Volume and nothing nested under it; `sweep`
+  removes every Volume no scope retains.
 - Equal CIDs are deduplicated within each broker tier.
 
 One cascade is one storage domain. Use separate brokers or database paths when
@@ -68,14 +68,15 @@ try await disk.advanceRetainedRoots(scope: "canonical", roots: [stateRoot])
 `mergeRetainedRoots` adds roots without replacing the set. Replacing a scope
 with the same set and merging roots already in it are naturally idempotent.
 
-A Volume root is live if a scope retains it, or if it is a member CID of a
-live, complete Volume and is itself a stored Volume root. Liveness is recursive.
+A Volume is kept if a scope retains its root, and only then. Retaining a root
+does not keep a Volume nested under it: a caller that wants one kept retains
+its root too.
 
 ```swift
 let removed = try await disk.sweep()
 ```
 
-`sweep` removes every Volume that is not live, then every CAS row no surviving
+`sweep` removes every Volume no scope retains, then every CAS row no surviving
 Volume owns, in one transaction. It has no grace window: content stored but not
 yet retained is swept, and a later advance naming it is refused. Callers store,
 then advance, and sweep only between their own commits.
@@ -98,8 +99,8 @@ database path. Malformed v2 schemas fail closed.
 | VolumeBroker owns | The caller owns |
 | --- | --- |
 | Volume validation and atomic publication | DAG traversal and Volume selection |
-| Local CAS, read cascading, and the reachability sweep | Storage placement and domain isolation |
-| Retained-root sets and recursive reachability | Which roots are retained, and when to sweep |
+| Local CAS, read cascading, and the sweep | Storage placement and domain isolation |
+| Retained-root sets | Which roots are retained, and when to sweep |
 | Storage integrity | Application state, canonicity, and consensus |
 
 See [correctness invariants](docs/correctness-invariants.md) for the review
