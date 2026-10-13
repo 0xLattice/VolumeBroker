@@ -89,6 +89,22 @@ let removed = try await disk.releaseRetainedRoots(scope: "canonical", roots: [ol
 scope retains, with the CAS rows that leaves unowned. Its work is in the roots
 named, not in the size of the store, and it touches nothing else.
 
+`retainedScopes(prefix:)` lists the scopes that retain something. A caller
+that keeps one scope per thing it holds uses it to find the ones it no longer
+has a reason for.
+
+- A scope's name is its bytes. A prefix is a prefix of bytes, the listing is
+  in byte order, and a name with a NUL is refused.
+- A listing is one snapshot of committed state, as every read is: reads run
+  on a connection of their own.
+- A scope is let go of with `releaseRetainedRoots`, naming what it retains.
+  Emptying one with `advanceRetainedRoots(scope:roots: [])` removes it from
+  the listing and reclaims nothing: its Volumes stay until a sweep, or a
+  release that names them.
+- Storing and then retaining are two commits. A release or a sweep between
+  them removes what was stored, and the retain is then refused whole with
+  `missingRetainedRoot`: store again and retry.
+
 ## Implementations
 
 - `MemoryBroker` is the in-memory twin with identical retention semantics.

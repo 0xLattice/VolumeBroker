@@ -254,6 +254,27 @@ struct DiskBrokerTests {
         #expect(await broker.hasVolume(root: drop) == false)
     }
 
+    /// What a node reads at start: the scopes a previous process left, and
+    /// only those, with a release it committed still in force.
+    @Test func scopesAndTheirListingSurviveReopen() async throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        do {
+            let broker = try DiskBroker(path: location.path)
+            try await broker.storeVolumesLocal([payload("one"), payload("two"), payload("three")])
+            try await broker.mergeRetainedRoots(scope: "chain:body:one", roots: [cid("one")])
+            try await broker.mergeRetainedRoots(scope: "chain:body:two", roots: [cid("two")])
+            try await broker.mergeRetainedRoots(scope: "chain:body:three", roots: [cid("three")])
+            try await broker.releaseRetainedRoots(scope: "chain:body:two", roots: [cid("two")])
+        }
+
+        let reopened = try DiskBroker(path: location.path)
+        #expect(try await reopened.retainedScopes(prefix: "chain:body:") == ["chain:body:one", "chain:body:three"])
+        #expect(try await reopened.retainedRoots(scope: "chain:body:one") == [cid("one")])
+        #expect(await reopened.hasVolume(root: cid("two")) == false)
+        #expect(await reopened.hasVolume(root: cid("three")))
+    }
+
     @Test func persistedRetentionSurvivesReopenThenControlsSweep() async throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }

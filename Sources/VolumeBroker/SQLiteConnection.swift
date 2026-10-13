@@ -45,28 +45,35 @@ final class SQLiteConnection: @unchecked Sendable {
         }
         self.db = handle
 
-        // Separate read-only connection so fetchVolumeLocal can run concurrently
-        // with write transactions in WAL mode without blocking.
+        // Reads have a connection of their own, so that in WAL mode a read is
+        // a snapshot of committed state and never waits on a writer. A
+        // read-only connection cannot open a WAL database whose `-wal` and
+        // `-shm` files do not exist yet, which is every store before its
+        // first write and, where SQLite removes them on a clean close, every
+        // store reopened: one empty write transaction creates them. There is
+        // no falling back to the write connection: a read there would see a
+        // transaction half done.
         var rhandle: OpaquePointer?
-        let rflags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
-        if sqlite3_open_v2(path, &rhandle, rflags, nil) == SQLITE_OK, let rhandle {
-            do {
-                try Self.enableForeignKeys(db: rhandle)
-                try Self.execRaw(db: rhandle, "PRAGMA busy_timeout=5000")
-                try Self.execRaw(db: rhandle, "PRAGMA cache_size=-16384")
-                self.readDb = rhandle
-            } catch {
-                sqlite3_close(rhandle)
-                self.readDb = handle
+        do {
+            try Self.execRaw(db: handle, "BEGIN IMMEDIATE; COMMIT")
+            let rflags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
+            guard sqlite3_open_v2(path, &rhandle, rflags, nil) == SQLITE_OK, let opened = rhandle else {
+                throw BrokerError.openFailed(
+                    rhandle.map { String(cString: sqlite3_errmsg($0)) } ?? "no read connection")
             }
-        } else {
-            // Fallback to the write connection if read-only open fails
-            self.readDb = handle
+            try Self.enableForeignKeys(db: opened)
+            try Self.execRaw(db: opened, "PRAGMA busy_timeout=5000")
+            try Self.execRaw(db: opened, "PRAGMA cache_size=-16384")
+            self.readDb = opened
+        } catch {
+            if let rhandle { sqlite3_close(rhandle) }
+            sqlite3_close(handle)
+            throw error
         }
     }
 
     deinit {
-        if readDb != db { sqlite3_close(readDb) }
+        sqlite3_close(readDb)
         sqlite3_close(db)
     }
 

@@ -134,6 +134,169 @@ struct RetentionTests {
     }
 
     @Test(arguments: Kind.allCases)
+    func scopesAreListedByPrefixWhileTheyRetainSomething(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("one"), Self.volume("two")])
+        try await broker.advanceRetainedRoots(scope: "body:b", roots: [Self.cid("one")])
+        try await broker.advanceRetainedRoots(scope: "body:a", roots: [Self.cid("one"), Self.cid("two")])
+        try await broker.advanceRetainedRoots(scope: "bodyguard", roots: [Self.cid("two")])
+        try await broker.advanceRetainedRoots(scope: "state", roots: [Self.cid("two")])
+        try await broker.advanceRetainedRoots(scope: "body:%", roots: [Self.cid("two")])
+
+        #expect(try await broker.retainedScopes(prefix: "body:") == ["body:%", "body:a", "body:b"])
+        #expect(try await broker.retainedScopes(prefix: "body") == ["body:%", "body:a", "body:b", "bodyguard"])
+        #expect(try await broker.retainedScopes(prefix: "") == ["body:%", "body:a", "body:b", "bodyguard", "state"])
+        #expect(try await broker.retainedScopes(prefix: "none") == [])
+
+        // A scope whose whole name is the prefix is listed.
+        try await broker.advanceRetainedRoots(scope: "body", roots: [Self.cid("one")])
+        #expect(try await broker.retainedScopes(prefix: "body").first == "body")
+        try await broker.advanceRetainedRoots(scope: "body", roots: [])
+
+        // A scope that retains nothing is not a scope any more.
+        try await broker.releaseRetainedRoots(scope: "body:b", roots: [Self.cid("one")])
+        try await broker.advanceRetainedRoots(scope: "body:%", roots: [])
+        #expect(try await broker.retainedScopes(prefix: "body:") == ["body:a"])
+    }
+
+    // MARK: - One scope per owner, as a chain node keeps them
+
+    /// A block's body is its own Volume and its transactions'. Two blocks
+    /// that carry one transaction each name it, so it goes with the second.
+    @Test(arguments: Kind.allCases)
+    func aRootTwoOwnersNameGoesWithTheSecond(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal(
+            ["block-a", "block-b", "shared-tx", "only-a-tx", "state"].map { Self.volume($0, ["\($0)-leaf"]) })
+        let (a, b) = ("chain:body:block-a", "chain:body:block-b")
+        try await broker.mergeRetainedRoots(scope: a, roots: ["block-a", "shared-tx", "only-a-tx"].map(Self.cid))
+        try await broker.mergeRetainedRoots(scope: b, roots: ["block-b", "shared-tx"].map(Self.cid))
+        try await broker.mergeRetainedRoots(scope: "chain", roots: [Self.cid("state")])
+
+        // Letting go of a block is releasing everything its scope retains.
+        let removed = try await broker.releaseRetainedRoots(scope: a, roots: try await broker.retainedRoots(scope: a))
+        #expect(removed == 2)
+        #expect(try await broker.retainedScopes(prefix: "chain:body:") == [b])
+        for gone in ["block-a", "only-a-tx"] {
+            #expect(await broker.hasVolume(root: Self.cid(gone)) == false, "\(gone)")
+            #expect(await broker.fetchDataLocal(cid: Self.cid("\(gone)-leaf")) == nil, "\(gone)")
+        }
+        for kept in ["block-b", "shared-tx", "state"] {
+            #expect(await broker.hasVolume(root: Self.cid(kept)), "\(kept)")
+        }
+        // The chain's own scope is not a body scope.
+        #expect(try await broker.retainedRoots(scope: "chain") == [Self.cid("state")])
+
+        #expect(try await broker.releaseRetainedRoots(scope: b, roots: try await broker.retainedRoots(scope: b)) == 2)
+        #expect(await broker.hasVolume(root: Self.cid("shared-tx")) == false)
+        #expect(try await broker.retainedScopes(prefix: "chain:body:") == [])
+        #expect(await broker.hasVolume(root: Self.cid("state")))
+    }
+
+    /// A store written before bodies had scopes of their own names a body
+    /// in the chain's scope too: releasing the block's scope keeps it.
+    @Test(arguments: Kind.allCases)
+    func aBodyTheChainScopeAlsoNamesStaysWhenItsOwnScopeGoes(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("block"), Self.volume("tx")])
+        try await broker.mergeRetainedRoots(scope: "chain", roots: ["block", "tx"].map(Self.cid))
+        try await broker.mergeRetainedRoots(scope: "chain:body:block", roots: ["block", "tx"].map(Self.cid))
+
+        #expect(try await broker.releaseRetainedRoots(
+            scope: "chain:body:block", roots: ["block", "tx"].map(Self.cid)) == 0)
+        #expect(await broker.hasVolume(root: Self.cid("block")))
+        #expect(await broker.hasVolume(root: Self.cid("tx")))
+        #expect(try await broker.retainedScopes(prefix: "chain:body:") == [])
+    }
+
+    /// After a crash a node lists its body scopes and drops the ones whose
+    /// block it has no record of: the rest, and what they share, stay.
+    @Test(arguments: Kind.allCases)
+    func leftoverScopesAreFoundByListingAndDropped(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        let blocks = (1...6).map { "block-\($0)" }
+        try await broker.storeVolumesLocal(blocks.map { Self.volume($0) } + [Self.volume("shared")])
+        for block in blocks {
+            try await broker.mergeRetainedRoots(
+                scope: "chain:body:\(Self.cid(block))", roots: [Self.cid(block), Self.cid("shared")])
+        }
+        let recorded = Set(["block-2", "block-5"].map(Self.cid))
+
+        for scope in try await broker.retainedScopes(prefix: "chain:body:") {
+            guard !recorded.contains(String(scope.dropFirst("chain:body:".count))) else { continue }
+            try await broker.releaseRetainedRoots(scope: scope, roots: try await broker.retainedRoots(scope: scope))
+        }
+
+        #expect(try await broker.retainedScopes(prefix: "chain:body:")
+            == recorded.map { "chain:body:\($0)" }.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) })
+        for block in blocks {
+            #expect(await broker.hasVolume(root: Self.cid(block)) == recorded.contains(Self.cid(block)), "\(block)")
+        }
+        #expect(await broker.hasVolume(root: Self.cid("shared")))
+    }
+
+    /// Thousands of owners beside one scope that retains far more: every
+    /// owner is listed once, in order, and releasing some lists the rest.
+    @Test(arguments: Kind.allCases)
+    func manyScopesAreEachListedOnce(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        let state = (0..<2_000).map { Self.volume("state-\($0)") }
+        try await broker.storeVolumesLocal(state + [Self.volume("body")])
+        try await broker.advanceRetainedRoots(scope: "chain", roots: state.map(\.root))
+        let scopes = (0..<1_500).map { "chain:body:\($0)" }
+        for scope in scopes {
+            try await broker.mergeRetainedRoots(scope: scope, roots: [Self.cid("body")])
+        }
+        let ordered = scopes.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+        #expect(try await broker.retainedScopes(prefix: "chain:body:") == ordered)
+        #expect(try await broker.retainedScopes(prefix: "chain:body:14") == ordered.filter { $0.hasPrefix("chain:body:14") })
+        #expect(try await broker.retainedScopes(prefix: "chain").count == 1_501)
+
+        for scope in scopes where scope.hasSuffix("7") {
+            try await broker.releaseRetainedRoots(scope: scope, roots: [Self.cid("body")])
+        }
+        #expect(try await broker.retainedScopes(prefix: "chain:body:") == ordered.filter { !$0.hasSuffix("7") })
+        // Still named by the scopes that are left.
+        #expect(await broker.hasVolume(root: Self.cid("body")))
+        #expect(try await broker.retainedRoots(scope: "chain").count == 2_000)
+    }
+
+    /// Two spellings of one text are two scopes, and a prefix is a prefix
+    /// of bytes: Swift's own string equality and `hasPrefix` say otherwise.
+    @Test(arguments: Kind.allCases)
+    func scopeNamesAreTheirBytes(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("one"), Self.volume("two")])
+        let composed = "caf\u{E9}"
+        let decomposed = "cafe\u{301}"
+        try await broker.advanceRetainedRoots(scope: composed, roots: [Self.cid("one")])
+        try await broker.advanceRetainedRoots(scope: decomposed, roots: [Self.cid("two")])
+
+        #expect(try await broker.retainedRoots(scope: composed) == [Self.cid("one")])
+        #expect(try await broker.retainedRoots(scope: decomposed) == [Self.cid("two")])
+        let all = try await broker.retainedScopes(prefix: "caf")
+        #expect(all.map { Array($0.utf8) } == [Array(decomposed.utf8), Array(composed.utf8)])
+        let plain = try await broker.retainedScopes(prefix: "cafe")
+        #expect(plain.map { Array($0.utf8) } == [Array(decomposed.utf8)])
+    }
+
+    @Test(arguments: Kind.allCases)
+    func aScopeNameWithANULIsRefused(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.store(volume: Self.volume("kept"))
+        await #expect(throws: BrokerError.self) {
+            try await broker.advanceRetainedRoots(scope: "a\0b", roots: [Self.cid("kept")])
+        }
+        await #expect(throws: BrokerError.self) {
+            try await broker.mergeRetainedRoots(scope: "a\0b", roots: [Self.cid("kept")])
+        }
+        await #expect(throws: BrokerError.self) {
+            try await broker.releaseRetainedRoots(scope: "a\0b", roots: [Self.cid("kept")])
+        }
+        #expect(try await broker.retainedScopes(prefix: "") == [])
+    }
+
+    @Test(arguments: Kind.allCases)
     func aRootNameWithANULIsRefused(kind: Kind) async throws {
         let broker = try Self.broker(kind)
         try await broker.store(volume: Self.volume("kept"))
@@ -253,6 +416,7 @@ struct RetentionTests {
         for scope in scopes {
             observation.scopes.append(try await broker.retainedRoots(scope: scope))
         }
+        observation.scopes.append(try await broker.retainedScopes(prefix: ""))
         return observation
     }
 

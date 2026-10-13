@@ -37,9 +37,7 @@ struct RetainedRootIndex {
 
     func advanceRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRoots(roots)
-        guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRoots("scope must not be empty")
-        }
+        try Self.validateScope(scope)
 
         try await connection.write {
             try connection.transaction {
@@ -62,9 +60,7 @@ struct RetainedRootIndex {
 
     func mergeRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRoots(roots)
-        guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRoots("scope must not be empty")
-        }
+        try Self.validateScope(scope)
 
         try await connection.write {
             try connection.transaction {
@@ -85,9 +81,7 @@ struct RetainedRootIndex {
     /// named, not in the size of the store.
     func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int {
         let canonicalRoots = try Self.canonicalRoots(roots)
-        guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRoots("scope must not be empty")
-        }
+        try Self.validateScope(scope)
 
         return try await connection.write {
             try connection.transaction {
@@ -147,8 +141,52 @@ struct RetainedRootIndex {
         }
     }
 
+    /// One statement, so one snapshot: a seek of the primary key per scope
+    /// found, from the first scope not before `prefix` to the first that
+    /// does not start with it. The work is in the scopes listed, not in how
+    /// many roots they retain. Names compare as bytes, in SQL and in the
+    /// in-memory broker alike.
+    func retainedScopes(prefix: String) async throws -> [String] {
+        // No scope's name holds a NUL, so none starts with such a prefix.
+        guard !prefix.utf8.contains(0) else { return [] }
+        return try await connection.read {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let starts = "substr(CAST(scope AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)"
+            let sql = """
+                WITH RECURSIVE found(scope) AS (
+                    SELECT min(scope) FROM retained_roots WHERE scope >= ?1
+                    UNION ALL
+                    SELECT (SELECT min(scope) FROM retained_roots WHERE scope > found.scope)
+                    FROM found WHERE scope IS NOT NULL AND \(starts)
+                )
+                SELECT scope FROM found WHERE scope IS NOT NULL AND \(starts)
+                """
+            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
+                  let stmt,
+                  sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+            }
+            var result: [String] = []
+            while true {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    guard sqlite3_column_type(stmt, 0) == SQLITE_TEXT,
+                          let ptr = sqlite3_column_text(stmt, 0) else {
+                        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                    }
+                    result.append(String(cString: ptr))
+                case SQLITE_DONE:
+                    return result
+                default:
+                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                }
+            }
+        }
+    }
+
     func retainedRoots(scope: String) async throws -> [String] {
-        guard !scope.isEmpty else { return [] }
+        guard !scope.isEmpty, !scope.utf8.contains(0) else { return [] }
         return try await connection.read {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
@@ -178,6 +216,18 @@ struct RetainedRootIndex {
         }
     }
 
+    private static func validateScope(_ scope: String) throws {
+        guard !scope.isEmpty else {
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
+        }
+        // SQLite reads a bound string up to its first NUL, so such a name
+        // would stand for another scope. By its bytes: a NUL under a
+        // combining mark is one Character that is not "\0".
+        guard !scope.utf8.contains(0) else {
+            throw BrokerError.invalidRetainedRoots("scope must not contain NUL")
+        }
+    }
+
     private static func canonicalRoots(_ roots: [String]) throws -> [String] {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
@@ -185,7 +235,7 @@ struct RetainedRootIndex {
         }
         // SQLite reads a bound string up to its first NUL, so such a name
         // would stand for another.
-        if unique.contains(where: { $0.contains("\0") }) {
+        if unique.contains(where: { $0.utf8.contains(0) }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain NUL")
         }
         return unique.sorted()

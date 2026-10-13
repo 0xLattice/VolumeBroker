@@ -10,7 +10,9 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         var contentByCID: [String: Data] = [:]
         var membersByRoot: [String: Set<String>] = [:]
         var ownersByCID: [String: Set<String>] = [:]
-        var retainedRoots: [String: Set<String>] = [:]
+        /// Keyed by a scope name's bytes, as SQLite compares them: two
+        /// spellings Swift calls equal are two scopes.
+        var retainedRoots: [[UInt8]: Set<String>] = [:]
     }
 
     private let lock = RWLock()
@@ -134,36 +136,34 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
 
     public func advanceRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRetainedRoots(roots)
-        guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRoots("scope must not be empty")
-        }
+        try Self.validateScope(scope)
 
         try lock.withWriteLock {
             for root in canonicalRoots {
                 try Self.validateRetainedVolume(root: root, state: state)
             }
-            state.retainedRoots[scope] = Set(canonicalRoots)
+            state.retainedRoots[Array(scope.utf8)] = canonicalRoots.isEmpty ? nil : Set(canonicalRoots)
         }
     }
 
     public func mergeRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRetainedRoots(roots)
-        guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRoots("scope must not be empty")
-        }
+        try Self.validateScope(scope)
 
         try lock.withWriteLock {
             for root in canonicalRoots {
                 try Self.validateRetainedVolume(root: root, state: state)
             }
-            state.retainedRoots[scope, default: []].formUnion(canonicalRoots)
+            if !canonicalRoots.isEmpty {
+                state.retainedRoots[Array(scope.utf8), default: []].formUnion(canonicalRoots)
+            }
         }
     }
 
     public func retainedRoots(scope: String) async throws -> [String] {
         guard !scope.isEmpty else { return [] }
         return lock.withReadLock {
-            Array(state.retainedRoots[scope] ?? []).sorted()
+            Array(state.retainedRoots[Array(scope.utf8)] ?? []).sorted()
         }
     }
 
@@ -182,12 +182,14 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
     @discardableResult
     public func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int {
         let canonicalRoots = try Self.canonicalRetainedRoots(roots)
-        guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRoots("scope must not be empty")
-        }
+        try Self.validateScope(scope)
 
         return lock.withWriteLock {
-            state.retainedRoots[scope]?.subtract(canonicalRoots)
+            let key = Array(scope.utf8)
+            if var retained = state.retainedRoots[key] {
+                retained.subtract(canonicalRoots)
+                state.retainedRoots[key] = retained.isEmpty ? nil : retained
+            }
             let dead = canonicalRoots.filter { root in
                 state.membersByRoot[root] != nil && !state.retainedRoots.values.contains { $0.contains(root) }
             }
@@ -198,6 +200,28 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         }
     }
 
+    public func retainedScopes(prefix: String) async throws -> [String] {
+        lock.withReadLock {
+            state.retainedRoots
+                .filter { !$0.value.isEmpty && $0.key.starts(with: prefix.utf8) }
+                .keys
+                .sorted { $0.lexicographicallyPrecedes($1) }
+                .map { String(decoding: $0, as: UTF8.self) }
+        }
+    }
+
+    private static func validateScope(_ scope: String) throws {
+        guard !scope.isEmpty else {
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
+        }
+        // SQLite reads a bound string up to its first NUL, so such a name
+        // would stand for another scope. By its bytes: a NUL under a
+        // combining mark is one Character that is not "\0".
+        guard !scope.utf8.contains(0) else {
+            throw BrokerError.invalidRetainedRoots("scope must not contain NUL")
+        }
+    }
+
     private static func canonicalRetainedRoots(_ roots: [String]) throws -> [String] {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
@@ -205,7 +229,7 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         }
         // SQLite reads a bound string up to its first NUL, so such a name
         // would stand for another.
-        if unique.contains(where: { $0.contains("\0") }) {
+        if unique.contains(where: { $0.utf8.contains(0) }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain NUL")
         }
         return unique.sorted()
