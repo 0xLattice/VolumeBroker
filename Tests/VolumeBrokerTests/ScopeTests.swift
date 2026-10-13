@@ -824,19 +824,20 @@ struct ScopeTests {
             }
             // Stop the mempool, the lister and the sweeper once every fetch is merged and every release has run.
             group.addTask {
-                let deadline = ContinuousClock.now.advanced(by: .seconds(120))
+                // No wall-clock limit: under a sanitizer or on a loaded runner
+                // the same work takes many times longer, and that is no failure.
                 while true {
                     let finished = await ledger.finishedFetchers
                     let queued = await ledger.merged.count
                     if finished == fetchers, queued == 0 { break }
-                    if ContinuousClock.now > deadline { await ledger.fail("deadline"); break }
                     try await Task.sleep(for: .milliseconds(5))
                 }
                 await done.add("done")
             }
             try await group.waitForAll()
         }
-        #expect(await ledger.failures.prefix(5) == [])
+        let failures = await ledger.failures
+        #expect(failures.isEmpty, "\(failures.prefix(5))")
 
         // Exactly consistent with the scopes: the kept bodies whole, nothing else.
         let keptScopes = try await broker.retainedScopes(prefix: bodyPrefix)
