@@ -121,6 +121,29 @@ struct CashewProtocolTests {
         #expect(try resolved.node?.get(key: "bob") == "v3")
     }
 
+    /// Cashew ends a Volume at each nested Volume's boundary, so the outer
+    /// Volume's entries do not hold the inner root: nothing but the inner
+    /// root's own retention keeps it.
+    @Test func sweepKeepsANestedVolumeOnlyWhenItsOwnRootIsRetained() async throws {
+        typealias Outer = VolumeImpl<MerkleDictionaryImpl<TestVolume>>
+        let inner = try TestVolume(node: TestDictionary().inserting(key: "k", value: "v"))
+        let outer = try Outer(node: MerkleDictionaryImpl<TestVolume>().inserting(key: "inner", value: inner))
+
+        for retainInner in [true, false] {
+            let broker = MemoryBroker()
+            try await outer.storeRecursively(storer: broker)
+            #expect(await broker.fetchVolumeLocal(root: outer.rawCID)?.entries[inner.rawCID] == nil)
+
+            try await broker.advanceRetainedRoots(
+                scope: "s", roots: retainInner ? [outer.rawCID, inner.rawCID] : [outer.rawCID])
+            try await broker.sweep()
+
+            #expect(await broker.hasVolume(root: outer.rawCID))
+            #expect(await broker.hasVolume(root: inner.rawCID) == retainInner)
+            #expect((await broker.fetchDataLocal(cid: inner.rawCID) != nil) == retainInner)
+        }
+    }
+
     @Test func batchedFetchReturnsRequestedVolumeRoots() async throws {
         let broker = MemoryBroker()
         let a = try TestVolume(node: TestDictionary().inserting(key: "k", value: "va"))
