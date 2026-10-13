@@ -198,6 +198,15 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         }
     }
 
+    public func retainedScopes(prefix: String) async throws -> [String] {
+        lock.withReadLock {
+            state.retainedRoots
+                .filter { !$0.value.isEmpty && $0.key.utf8.starts(with: prefix.utf8) }
+                .map(\.key)
+                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+        }
+    }
+
     private static func canonicalRetainedRoots(_ roots: [String]) throws -> [String] {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {

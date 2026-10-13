@@ -147,6 +147,45 @@ struct RetainedRootIndex {
         }
     }
 
+    /// One seek of the primary key per scope found, from the first scope
+    /// not before `prefix` to the first that does not start with it: the
+    /// work is in the scopes listed, not in how many roots they retain.
+    /// Scopes compare as bytes, as the in-memory broker compares them.
+    func retainedScopes(prefix: String) async throws -> [String] {
+        try await connection.read {
+            var result: [String] = []
+            var next = try scope(notBefore: prefix, strictly: false)
+            while let scope = next, scope.utf8.starts(with: prefix.utf8) {
+                result.append(scope)
+                next = try self.scope(notBefore: scope, strictly: true)
+            }
+            return result
+        }
+    }
+
+    /// On the read connection.
+    private func scope(notBefore bound: String, strictly: Bool) throws -> String? {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = "SELECT scope FROM retained_roots WHERE scope \(strictly ? ">" : ">=") ?1 ORDER BY scope LIMIT 1"
+        guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
+              let stmt,
+              sqlite3_bind_text(stmt, 1, bound, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+        }
+        switch sqlite3_step(stmt) {
+        case SQLITE_ROW:
+            guard let ptr = sqlite3_column_text(stmt, 0) else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+            }
+            return String(cString: ptr)
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+        }
+    }
+
     func retainedRoots(scope: String) async throws -> [String] {
         guard !scope.isEmpty else { return [] }
         return try await connection.read {

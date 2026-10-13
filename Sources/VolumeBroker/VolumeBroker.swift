@@ -58,6 +58,11 @@ public protocol RetainedRootReleaseBroker: RetainedRootMergeBroker {
     /// unless it is named here. Returns the number of Volumes removed.
     @discardableResult
     func releaseRetainedRoots(scope: String, roots: [String]) async throws -> Int
+
+    /// The scopes that retain at least one root and whose name starts with
+    /// `prefix`, sorted. A caller that keeps one scope per thing it holds
+    /// finds the scopes it no longer has a reason for.
+    func retainedScopes(prefix: String) async throws -> [String]
 }
 
 public extension VolumeBroker {

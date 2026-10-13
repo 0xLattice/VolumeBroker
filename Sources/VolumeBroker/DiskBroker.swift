@@ -78,6 +78,10 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootReleaseBroker {
         try await retainedRoots.releaseRetainedRoots(scope: scope, roots: roots)
     }
 
+    public func retainedScopes(prefix: String) async throws -> [String] {
+        try await retainedRoots.retainedScopes(prefix: prefix)
+    }
+
     public func checkpoint() async {
         await connection.checkpoint()
     }

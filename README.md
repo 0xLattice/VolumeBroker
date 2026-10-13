@@ -89,6 +89,10 @@ let removed = try await disk.releaseRetainedRoots(scope: "canonical", roots: [ol
 scope retains, with the CAS rows that leaves unowned. Its work is in the roots
 named, not in the size of the store, and it touches nothing else.
 
+`retainedScopes(prefix:)` lists the scopes that retain something. A caller
+that keeps one scope per thing it holds uses it to find the ones it no longer
+has a reason for.
+
 ## Implementations
 
 - `MemoryBroker` is the in-memory twin with identical retention semantics.

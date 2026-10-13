@@ -134,6 +134,27 @@ struct RetentionTests {
     }
 
     @Test(arguments: Kind.allCases)
+    func scopesAreListedByPrefixWhileTheyRetainSomething(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("one"), Self.volume("two")])
+        try await broker.advanceRetainedRoots(scope: "body:b", roots: [Self.cid("one")])
+        try await broker.advanceRetainedRoots(scope: "body:a", roots: [Self.cid("one"), Self.cid("two")])
+        try await broker.advanceRetainedRoots(scope: "bodyguard", roots: [Self.cid("two")])
+        try await broker.advanceRetainedRoots(scope: "state", roots: [Self.cid("two")])
+        try await broker.advanceRetainedRoots(scope: "body:%", roots: [Self.cid("two")])
+
+        #expect(try await broker.retainedScopes(prefix: "body:") == ["body:%", "body:a", "body:b"])
+        #expect(try await broker.retainedScopes(prefix: "body") == ["body:%", "body:a", "body:b", "bodyguard"])
+        #expect(try await broker.retainedScopes(prefix: "") == ["body:%", "body:a", "body:b", "bodyguard", "state"])
+        #expect(try await broker.retainedScopes(prefix: "none") == [])
+
+        // A scope that retains nothing is not a scope any more.
+        try await broker.releaseRetainedRoots(scope: "body:b", roots: [Self.cid("one")])
+        try await broker.advanceRetainedRoots(scope: "body:%", roots: [])
+        #expect(try await broker.retainedScopes(prefix: "body:") == ["body:a"])
+    }
+
+    @Test(arguments: Kind.allCases)
     func aRootNameWithANULIsRefused(kind: Kind) async throws {
         let broker = try Self.broker(kind)
         try await broker.store(volume: Self.volume("kept"))
@@ -253,6 +274,7 @@ struct RetentionTests {
         for scope in scopes {
             observation.scopes.append(try await broker.retainedRoots(scope: scope))
         }
+        observation.scopes.append(try await broker.retainedScopes(prefix: ""))
         return observation
     }
 
