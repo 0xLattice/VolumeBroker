@@ -347,7 +347,7 @@ struct DiskBrokerTests {
         #expect(try await broker.retainedRoots(scope: "chain-a:state") == [root])
     }
 
-    @Test func retainedRootRetainsMemberVolume() async throws {
+    @Test func retainedRootDoesNotRetainMemberVolume() async throws {
         let broker = try tempDB()
         let object = cid("object")
         let child = cid("child")
@@ -362,11 +362,14 @@ struct DiskBrokerTests {
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [object])
         let evicted = try await broker.sweep()
 
-        #expect(evicted == 1)
+        #expect(evicted == 2)
         #expect(await broker.hasVolume(root: object))
-        #expect(await broker.hasVolume(root: child))
+        #expect(await broker.hasVolume(root: child) == false)
         #expect(await broker.hasVolume(root: drop) == false)
-        #expect(await broker.fetchDataLocal(cid: leaf) == Data("leaf".utf8))
+        // The member's own bytes are an entry of the retained Volume; what
+        // was under it is not.
+        #expect(await broker.fetchDataLocal(cid: child) == Data("child".utf8))
+        #expect(await broker.fetchDataLocal(cid: leaf) == nil)
     }
 
     @Test func simultaneousStartSharedStateLinearizability() async throws {

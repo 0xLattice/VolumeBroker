@@ -9,7 +9,7 @@ import VolumeBrokerSQLite
 #endif
 @testable import VolumeBroker
 
-/// Recursive retention and sweep, run against both brokers.
+/// Retention and sweep, run against both brokers.
 @Suite("Retention")
 struct RetentionTests {
 
@@ -46,7 +46,7 @@ struct RetentionTests {
     }
 
     @Test(arguments: Kind.allCases)
-    func retentionRecursesThroughThreeLevelsOfNestedVolumes(kind: Kind) async throws {
+    func aRetainedRootKeepsItsOwnVolumeAndNothingNestedUnderIt(kind: Kind) async throws {
         let broker = try Self.broker(kind)
         try await broker.storeVolumesLocal([
             Self.volume("top", ["mid", "top-leaf"]),
@@ -54,35 +54,43 @@ struct RetentionTests {
             Self.volume("bottom", ["bottom-leaf"]),
             Self.volume("stray", ["stray-leaf"]),
         ])
-        try await broker.advanceRetainedRoots(scope: "s", roots: [Self.cid("top")])
+        // `mid` is nested under a retained root and holds another: neither keeps it.
+        try await broker.advanceRetainedRoots(scope: "s", roots: [Self.cid("top"), Self.cid("bottom")])
 
-        #expect(try await broker.sweep() == 1)
-        for root in ["top", "mid", "bottom"] {
+        #expect(try await broker.sweep() == 2)
+        for root in ["top", "bottom"] {
             #expect(await broker.hasVolume(root: Self.cid(root)), "\(root)")
         }
-        for leaf in ["top-leaf", "mid-leaf", "bottom-leaf"] {
-            #expect(await broker.fetchDataLocal(cid: Self.cid(leaf)) == Data(leaf.utf8), "\(leaf)")
+        for root in ["mid", "stray"] {
+            #expect(await broker.hasVolume(root: Self.cid(root)) == false, "\(root)")
         }
-        #expect(await broker.hasVolume(root: Self.cid("stray")) == false)
-        #expect(await broker.fetchDataLocal(cid: Self.cid("stray-leaf")) == nil)
+        // A kept Volume keeps its own entries, a nested root's bytes among them.
+        for kept in ["top-leaf", "mid", "bottom-leaf"] {
+            #expect(await broker.fetchDataLocal(cid: Self.cid(kept)) == Data(kept.utf8), "\(kept)")
+        }
+        for swept in ["mid-leaf", "stray-leaf"] {
+            #expect(await broker.fetchDataLocal(cid: Self.cid(swept)) == nil, "\(swept)")
+        }
     }
 
     @Test(arguments: Kind.allCases)
-    func advancingSweepsTheOldBranchButKeepsSharedMembers(kind: Kind) async throws {
+    func advancingSweepsWhatTheNewSetDoesNotName(kind: Kind) async throws {
         let broker = try Self.broker(kind)
         try await broker.storeVolumesLocal([
             Self.volume("old", ["shared", "old-branch"]),
             Self.volume("shared", ["shared-leaf"]),
             Self.volume("old-branch", ["old-leaf"]),
         ])
-        try await broker.advanceRetainedRoots(scope: "s", roots: [Self.cid("old")])
+        try await broker.advanceRetainedRoots(
+            scope: "s", roots: ["old", "shared", "old-branch"].map(Self.cid))
         #expect(try await broker.sweep() == 0)
 
         try await broker.storeVolumesLocal([
             Self.volume("new", ["shared", "new-branch"]),
             Self.volume("new-branch", ["new-leaf"]),
         ])
-        try await broker.advanceRetainedRoots(scope: "s", roots: [Self.cid("new")])
+        try await broker.advanceRetainedRoots(
+            scope: "s", roots: ["new", "shared", "new-branch"].map(Self.cid))
         #expect(try await broker.sweep() == 2)
 
         for root in ["new", "shared", "new-branch"] {

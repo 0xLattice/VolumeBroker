@@ -5,39 +5,23 @@ import SQLite3
 import VolumeBrokerSQLite
 #endif
 
-/// Named retained-root sets, the reachability they define, and the sweep that
-/// reclaims everything else. Replacing a scope with the same set and merging
+/// Named retained-root sets and the sweep that reclaims everything they do
+/// not name. Replacing a scope with the same set and merging
 /// existing roots are naturally idempotent.
 struct RetainedRootIndex {
     let connection: SQLiteConnection
 
-    /// The definition of liveness used by `sweep`. A root is live if a scope retains it, or if it is a member of a
-    /// live, complete Volume and has its own `volume_metadata` row.
-    static let liveRootsCTE = """
-        WITH RECURSIVE live_roots(root) AS (
-            SELECT root FROM retained_roots
-            UNION
-            SELECT member.cid
-            FROM live_roots
-            JOIN volume_metadata vm ON vm.root = live_roots.root
-            JOIN volume_entries member ON member.root = vm.root
-            JOIN volume_metadata child ON child.root = member.cid
-            WHERE \(CASVolumeStore.completeVolumePredicate)
-        )
-        """
-
-    /// Delete every Volume that is not live (its membership cascades), then every
+    /// Delete every Volume no scope retains (its membership cascades), then every
     /// CAS row no surviving Volume owns, in one transaction on the serial
     /// write connection. Advances and stores serialize against it there, so a
-    /// root an advance commits first is live for the sweep, and an advance
+    /// root an advance commits first is kept by the sweep, and an advance
     /// that runs after it sees exactly what survived.
     func sweep() async throws -> Int {
         try await connection.write {
             try connection.transaction {
                 try connection.exec("""
-                    \(Self.liveRootsCTE)
                     DELETE FROM volume_metadata
-                    WHERE root NOT IN (SELECT root FROM live_roots)
+                    WHERE root NOT IN (SELECT root FROM retained_roots)
                     """)
                 let removed = Int(sqlite3_changes(connection.db))
                 try connection.exec("""

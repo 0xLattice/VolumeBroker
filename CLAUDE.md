@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> **Project:** VolumeBroker — Volume-granular content-addressed storage for cashew Merkle DAGs (memory/disk brokers, retained roots with recursive reachability sweep, tiered fetch cascade). Standalone; depends on cashew. Lattice is one consumer, not a dependency. Build/test: `swift build` / `swift test`.
+> **Project:** VolumeBroker — Volume-granular content-addressed storage for cashew Merkle DAGs (memory/disk brokers, retained roots and a sweep of everything they do not name, tiered fetch cascade). Standalone; depends on cashew. Lattice is one consumer, not a dependency. Build/test: `swift build` / `swift test`.
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 

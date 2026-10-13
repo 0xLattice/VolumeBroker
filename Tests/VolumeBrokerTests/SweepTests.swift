@@ -125,8 +125,8 @@ struct SweepTests {
     }
 
     /// Corrupt bytes are not served and flag nothing, so a read of a corrupt
-    /// leaf never shrinks the live closure.
-    @Test func corruptLeafReadThenSweepRemovesNothingReachable() async throws {
+    /// leaf never shrinks what a sweep keeps.
+    @Test func corruptLeafReadThenSweepRemovesNothingRetained() async throws {
         let h = try harness()
         let top = SerializedVolume(root: cid("top"), entries: [
             cid("top"): Data("top".utf8),
@@ -135,7 +135,7 @@ struct SweepTests {
         ])
         let mid = volume("mid", ["mid-leaf": Data("mid-leaf".utf8)])
         try await h.store.storeVolumesLocal([top, mid])
-        try await h.retained.advanceRetainedRoots(scope: "s", roots: [top.root])
+        try await h.retained.advanceRetainedRoots(scope: "s", roots: [top.root, mid.root])
         try await h.connection.write {
             try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(cid("top-leaf"))'")
         }
