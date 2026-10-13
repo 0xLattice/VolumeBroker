@@ -148,10 +148,50 @@ struct RetentionTests {
         #expect(try await broker.retainedScopes(prefix: "") == ["body:%", "body:a", "body:b", "bodyguard", "state"])
         #expect(try await broker.retainedScopes(prefix: "none") == [])
 
+        // A scope whose whole name is the prefix is listed.
+        try await broker.advanceRetainedRoots(scope: "body", roots: [Self.cid("one")])
+        #expect(try await broker.retainedScopes(prefix: "body").first == "body")
+        try await broker.advanceRetainedRoots(scope: "body", roots: [])
+
         // A scope that retains nothing is not a scope any more.
         try await broker.releaseRetainedRoots(scope: "body:b", roots: [Self.cid("one")])
         try await broker.advanceRetainedRoots(scope: "body:%", roots: [])
         #expect(try await broker.retainedScopes(prefix: "body:") == ["body:a"])
+    }
+
+    /// Two spellings of one text are two scopes, and a prefix is a prefix
+    /// of bytes: Swift's own string equality and `hasPrefix` say otherwise.
+    @Test(arguments: Kind.allCases)
+    func scopeNamesAreTheirBytes(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("one"), Self.volume("two")])
+        let composed = "caf\u{E9}"
+        let decomposed = "cafe\u{301}"
+        try await broker.advanceRetainedRoots(scope: composed, roots: [Self.cid("one")])
+        try await broker.advanceRetainedRoots(scope: decomposed, roots: [Self.cid("two")])
+
+        #expect(try await broker.retainedRoots(scope: composed) == [Self.cid("one")])
+        #expect(try await broker.retainedRoots(scope: decomposed) == [Self.cid("two")])
+        let all = try await broker.retainedScopes(prefix: "caf")
+        #expect(all.map { Array($0.utf8) } == [Array(decomposed.utf8), Array(composed.utf8)])
+        let plain = try await broker.retainedScopes(prefix: "cafe")
+        #expect(plain.map { Array($0.utf8) } == [Array(decomposed.utf8)])
+    }
+
+    @Test(arguments: Kind.allCases)
+    func aScopeNameWithANULIsRefused(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.store(volume: Self.volume("kept"))
+        await #expect(throws: BrokerError.self) {
+            try await broker.advanceRetainedRoots(scope: "a\0b", roots: [Self.cid("kept")])
+        }
+        await #expect(throws: BrokerError.self) {
+            try await broker.mergeRetainedRoots(scope: "a\0b", roots: [Self.cid("kept")])
+        }
+        await #expect(throws: BrokerError.self) {
+            try await broker.releaseRetainedRoots(scope: "a\0b", roots: [Self.cid("kept")])
+        }
+        #expect(try await broker.retainedScopes(prefix: "") == [])
     }
 
     @Test(arguments: Kind.allCases)
