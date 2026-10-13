@@ -25,7 +25,8 @@ Retention never substitutes for publication.
 | VOLUME-018 | SQLite WAL with `synchronous=FULL` is the durable-commit boundary: a returned store survives a crash, so a later advance never names lost content. |
 | VOLUME-019 | A batched CID read applies the same complete-owner serve gate, CID validation and local-to-far precedence as scalar reads. |
 | VOLUME-020 | `releaseRetainedRoots` removes the named roots from one scope, then each of those Volumes no scope retains and the CAS rows that leaves unowned, in one transaction. It touches no Volume it was not given, and its work is in the roots named. |
-| VOLUME-021 | A scope is named by the bytes of its name, which hold no NUL, and exists while it retains a root. `retainedScopes(prefix:)` lists those whose name starts with the prefix, as one snapshot, the same on both brokers, at the cost of the scopes listed. |
+| VOLUME-021 | A scope is named by the bytes of its name, which hold no NUL, and exists while it retains a root. `retainedScopes(prefix:)` lists those whose name starts with the prefix, in byte order, the same on both brokers; a NUL in a read names no scope. On disk the listing costs the scopes listed, not the roots retained. |
+| VOLUME-022 | Reads run on a read-only connection of their own, never the write connection: a read is a snapshot of committed state and sees no transaction half done. Opening creates the WAL files that connection needs, and fails if it cannot be had. |
 
 A read never writes: corruption only hides the corrupt bytes from readers, so a
 database error or a corrupt leaf can never shrink what a retained root keeps.

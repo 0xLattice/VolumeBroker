@@ -147,7 +147,9 @@ struct RetainedRootIndex {
     /// many roots they retain. Names compare as bytes, in SQL and in the
     /// in-memory broker alike.
     func retainedScopes(prefix: String) async throws -> [String] {
-        try await connection.read {
+        // No scope's name holds a NUL, so none starts with such a prefix.
+        guard !prefix.contains("\0") else { return [] }
+        return try await connection.read {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             let starts = "substr(CAST(scope AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)"
@@ -184,7 +186,7 @@ struct RetainedRootIndex {
     }
 
     func retainedRoots(scope: String) async throws -> [String] {
-        guard !scope.isEmpty else { return [] }
+        guard !scope.isEmpty, !scope.contains("\0") else { return [] }
         return try await connection.read {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }

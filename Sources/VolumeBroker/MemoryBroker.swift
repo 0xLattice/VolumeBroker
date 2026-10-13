@@ -142,7 +142,7 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
             for root in canonicalRoots {
                 try Self.validateRetainedVolume(root: root, state: state)
             }
-            state.retainedRoots[Array(scope.utf8)] = Set(canonicalRoots)
+            state.retainedRoots[Array(scope.utf8)] = canonicalRoots.isEmpty ? nil : Set(canonicalRoots)
         }
     }
 
@@ -154,7 +154,9 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
             for root in canonicalRoots {
                 try Self.validateRetainedVolume(root: root, state: state)
             }
-            state.retainedRoots[Array(scope.utf8), default: []].formUnion(canonicalRoots)
+            if !canonicalRoots.isEmpty {
+                state.retainedRoots[Array(scope.utf8), default: []].formUnion(canonicalRoots)
+            }
         }
     }
 
@@ -183,7 +185,11 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         try Self.validateScope(scope)
 
         return lock.withWriteLock {
-            state.retainedRoots[Array(scope.utf8)]?.subtract(canonicalRoots)
+            let key = Array(scope.utf8)
+            if var retained = state.retainedRoots[key] {
+                retained.subtract(canonicalRoots)
+                state.retainedRoots[key] = retained.isEmpty ? nil : retained
+            }
             let dead = canonicalRoots.filter { root in
                 state.membersByRoot[root] != nil && !state.retainedRoots.values.contains { $0.contains(root) }
             }
