@@ -189,6 +189,45 @@ struct SweepTests {
         #expect(await casRowCount(connection: h.connection, cid: cid(for: shared)) == 1)
     }
 
+    @Test func releaseDeletesTheBytesItLeavesUnownedAndNoOthers() async throws {
+        let h = try harness()
+        let shared = Data("shared".utf8)
+        let own = Data("own".utf8)
+        try await h.store.storeVolumesLocal([
+            volume("gone", ["shared": shared, "own": own]),
+            volume("kept", ["shared": shared]),
+        ])
+        try await h.retained.advanceRetainedRoots(scope: "s", roots: [cid("gone"), cid("kept")])
+
+        #expect(try await h.retained.releaseRetainedRoots(scope: "s", roots: [cid("gone")]) == 1)
+        #expect(await casRowCount(connection: h.connection, cid: cid("gone")) == 0)
+        #expect(await casRowCount(connection: h.connection, cid: cid(for: own)) == 0)
+        #expect(await casRowCount(connection: h.connection, cid: cid(for: shared)) == 1)
+        #expect(await casRowCount(connection: h.connection, cid: cid("kept")) == 1)
+    }
+
+    @Test func releaseSQLFailureRollsBackWholeRelease() async throws {
+        let h = try harness()
+        let leaf = Data("leaf".utf8)
+        try await h.store.storeVolumesLocal([volume("first", ["leaf": leaf]), volume("second")])
+        try await h.retained.advanceRetainedRoots(scope: "s", roots: [cid("first"), cid("second")])
+        sqlite3_set_authorizer(h.connection.db, { _, action, table, _, _, _ in
+            guard action == SQLITE_DELETE, let table,
+                  String(cString: table) == "cas_data" else { return SQLITE_OK }
+            return SQLITE_DENY
+        }, nil)
+        defer { sqlite3_set_authorizer(h.connection.db, nil, nil) }
+
+        await #expect(throws: BrokerError.self) {
+            try await h.retained.releaseRetainedRoots(scope: "s", roots: [cid("first"), cid("second")])
+        }
+        sqlite3_set_authorizer(h.connection.db, nil, nil)
+        #expect(try await h.retained.retainedRoots(scope: "s") == [cid("first"), cid("second")].sorted())
+        #expect(await h.store.hasVolume(root: cid("first")))
+        #expect(await h.store.hasVolume(root: cid("second")))
+        #expect(await casRowCount(connection: h.connection, cid: cid(for: leaf)) == 1)
+    }
+
     private func casRowCount(connection: SQLiteConnection, cid: String) async -> Int {
         await connection.read {
             var stmt: OpaquePointer?

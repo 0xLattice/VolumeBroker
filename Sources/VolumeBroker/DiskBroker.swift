@@ -6,7 +6,7 @@ import Foundation
 /// it owns no SQL itself. The layers are:
 ///   - `SQLiteConnection`  — connection/PRAGMA/schema + serialised read/write access.
 ///   - `CASVolumeStore`    — content-addressed volume store (store/fetch/has).
-///   - `RetainedRootIndex` — named retained-root sets and sweep.
+///   - `RetainedRootIndex` — named retained-root sets, release, and sweep.
 ///
 /// Durability: the write connection runs WAL with `synchronous=FULL`, so every
 /// committed transaction is fsynced to the WAL before `COMMIT` returns. A

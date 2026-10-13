@@ -5,8 +5,8 @@ import SQLite3
 import VolumeBrokerSQLite
 #endif
 
-/// Named retained-root sets and the sweep that reclaims everything they do
-/// not name. Replacing a scope with the same set and merging
+/// Named retained-root sets, the release that reclaims named roots, and the
+/// sweep that reclaims everything no set names. Replacing a scope with the same set and merging
 /// existing roots are naturally idempotent.
 struct RetainedRootIndex {
     let connection: SQLiteConnection
@@ -182,6 +182,11 @@ struct RetainedRootIndex {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain empty strings")
+        }
+        // SQLite reads a bound string up to its first NUL, so such a name
+        // would stand for another.
+        if unique.contains(where: { $0.contains("\0") }) {
+            throw BrokerError.invalidRetainedRoots("roots must not contain NUL")
         }
         return unique.sorted()
     }

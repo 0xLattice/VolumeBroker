@@ -134,6 +134,23 @@ struct RetentionTests {
     }
 
     @Test(arguments: Kind.allCases)
+    func aRootNameWithANULIsRefused(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.store(volume: Self.volume("kept"))
+        try await broker.advanceRetainedRoots(scope: "s", roots: [Self.cid("kept")])
+        let truncating = Self.cid("kept") + "\0junk"
+
+        await #expect(throws: BrokerError.self) {
+            try await broker.releaseRetainedRoots(scope: "s", roots: [truncating])
+        }
+        await #expect(throws: BrokerError.self) {
+            try await broker.mergeRetainedRoots(scope: "s", roots: [truncating])
+        }
+        #expect(try await broker.retainedRoots(scope: "s") == [Self.cid("kept")])
+        #expect(await broker.hasVolume(root: Self.cid("kept")))
+    }
+
+    @Test(arguments: Kind.allCases)
     func releasingAVolumeInNoScopeRemovesIt(kind: Kind) async throws {
         let broker = try Self.broker(kind)
         try await broker.storeVolumesLocal([Self.volume("stray", ["stray-leaf"])])
@@ -267,6 +284,18 @@ struct RetentionTests {
         let memory = try Self.broker(.memory)
         let disk = try Self.broker(.disk)
 
+        // Start with everything stored and each scope retaining some of it,
+        // so that sweep and release meet retained roots in every sequence.
+        for broker in [memory, disk] {
+            try await broker.storeVolumesLocal(universe)
+        }
+        for scope in Self.scopes {
+            let roots = universe.map(\.root).filter { _ in Bool.random(using: &rng) }
+            for broker in [memory, disk] {
+                try await broker.advanceRetainedRoots(scope: scope, roots: roots)
+            }
+        }
+
         for step in 0..<60 {
             let op = Int.random(in: 0..<5, using: &rng)
             let scope = Self.scopes.randomElement(using: &rng)!
@@ -274,6 +303,13 @@ struct RetentionTests {
                 universe.randomElement(using: &rng)!
             }
             var roots = universe.map(\.root).filter { _ in Bool.random(using: &rng) }
+            // Mostly roots that are stored, so that retaining succeeds and
+            // sweep and release meet retained roots.
+            if Int.random(in: 0..<8, using: &rng) != 0 {
+                var stored: [String] = []
+                for root in roots where await memory.hasVolume(root: root) { stored.append(root) }
+                roots = stored
+            }
             if Int.random(in: 0..<8, using: &rng) == 0 { roots.append(Self.cid("absent")) }
 
             let memoryResult = await Self.apply(memory, op: op, roots: roots, batch: batch, scope: scope)

@@ -188,8 +188,9 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
 
         return lock.withWriteLock {
             state.retainedRoots[scope]?.subtract(canonicalRoots)
-            let retained = Set(state.retainedRoots.values.joined())
-            let dead = canonicalRoots.filter { state.membersByRoot[$0] != nil && !retained.contains($0) }
+            let dead = canonicalRoots.filter { root in
+                state.membersByRoot[root] != nil && !state.retainedRoots.values.contains { $0.contains(root) }
+            }
             for root in dead {
                 Self.removeVolume(root: root, state: &state)
             }
@@ -201,6 +202,11 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain empty strings")
+        }
+        // SQLite reads a bound string up to its first NUL, so such a name
+        // would stand for another.
+        if unique.contains(where: { $0.contains("\0") }) {
+            throw BrokerError.invalidRetainedRoots("roots must not contain NUL")
         }
         return unique.sorted()
     }
