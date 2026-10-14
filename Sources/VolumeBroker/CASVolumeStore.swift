@@ -186,23 +186,36 @@ struct CASVolumeStore: VolumeStorer {
 
         try await connection.write {
             try connection.transaction {
+                // A later store of a root replaces its entry list: only the
+                // root's own bytes are verified on receipt, so a first answer
+                // is never final.
+                var droppedByRoot: [String: Set<String>] = [:]
                 for volume in batch.volumes {
-                    try validateExistingMembership(of: volume)
+                    droppedByRoot[volume.root] = try existingMembers(root: volume.root)
+                        .subtracting(volume.entries.keys)
                 }
                 for (cid, data) in batch.contentByCID {
                     try validateExistingContent(cid: cid, data: data)
                 }
 
                 for volume in batch.volumes {
-                    try insertMetadata(root: volume.root, entryCount: volume.entries.count)
+                    try upsertMetadata(root: volume.root, entryCount: volume.entries.count)
                 }
                 for (cid, data) in batch.contentByCID {
                     try insertCASData(cid: cid, data: data)
                 }
                 for volume in batch.volumes {
+                    for cid in droppedByRoot[volume.root] ?? [] {
+                        try deleteVolumeEntry(root: volume.root, cid: cid)
+                    }
                     for cid in volume.entries.keys {
                         try insertVolumeEntry(root: volume.root, cid: cid)
                     }
+                }
+                // Reclaimed as a release reclaims: a dropped CID goes only
+                // when no Volume lists it any more.
+                for cid in Set(droppedByRoot.values.joined()) {
+                    try deleteUnownedCASData(cid: cid)
                 }
                 for volume in batch.volumes {
                     try verifyComplete(root: volume.root, entryCount: volume.entries.count)
@@ -216,24 +229,23 @@ struct CASVolumeStore: VolumeStorer {
         let contentByCID: [String: Data]
     }
 
+    /// Within one batch, too, a later Volume for a root replaces an earlier one.
     private static func validateBatch(_ submitted: [SerializedVolume]) throws -> ValidatedBatch {
-        var memberships: [String: Set<String>] = [:]
+        var indexByRoot: [String: Int] = [:]
         var contentByCID: [String: Data] = [:]
         var volumes: [SerializedVolume] = []
 
         for submittedVolume in submitted {
             let volume = submittedVolume.ownedCopy()
             try volume.validate()
-            let members = Set(volume.entries.keys)
-            if let existing = memberships[volume.root] {
-                guard existing == members else {
-                    throw BrokerError.conflictingVolume(volume.root)
-                }
+            if let index = indexByRoot[volume.root] {
+                volumes[index] = volume
             } else {
-                memberships[volume.root] = members
+                indexByRoot[volume.root] = volumes.count
                 volumes.append(volume)
             }
-
+        }
+        for volume in volumes {
             for (cid, data) in volume.entries {
                 if let existing = contentByCID[cid], existing != data {
                     throw BrokerError.conflictingContent(cid)
@@ -246,65 +258,30 @@ struct CASVolumeStore: VolumeStorer {
 
     // MARK: - Transaction helpers
 
-    private func validateExistingMembership(of volume: SerializedVolume) throws {
-        var metadataStmt: OpaquePointer?
-        defer { sqlite3_finalize(metadataStmt) }
-        guard sqlite3_prepare_v2(
-            connection.db,
-            "SELECT entry_count FROM volume_metadata WHERE root = ?1",
-            -1,
-            &metadataStmt,
-            nil
-        ) == SQLITE_OK, let metadataStmt else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        sqlite3_bind_text(metadataStmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
-
-        let metadataResult = sqlite3_step(metadataStmt)
-        let existingEntryCount: Int?
-        if metadataResult == SQLITE_ROW {
-            guard sqlite3_column_type(metadataStmt, 0) == SQLITE_INTEGER else {
-                throw BrokerError.conflictingVolume(volume.root)
-            }
-            existingEntryCount = Int(sqlite3_column_int64(metadataStmt, 0))
-        } else if metadataResult == SQLITE_DONE {
-            existingEntryCount = nil
-        } else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-
-        var membersStmt: OpaquePointer?
-        defer { sqlite3_finalize(membersStmt) }
+    private func existingMembers(root: String) throws -> Set<String> {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(
             connection.db,
             "SELECT cid FROM volume_entries WHERE root = ?1",
             -1,
-            &membersStmt,
+            &stmt,
             nil
-        ) == SQLITE_OK, let membersStmt else {
+        ) == SQLITE_OK, let stmt else {
             throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
         }
-        sqlite3_bind_text(membersStmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
+        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
 
-        var existingMembers = Set<String>()
+        var members = Set<String>()
         while true {
-            let result = sqlite3_step(membersStmt)
+            let result = sqlite3_step(stmt)
             if result == SQLITE_DONE { break }
-            guard result == SQLITE_ROW, let cid = sqlite3_column_text(membersStmt, 0) else {
+            guard result == SQLITE_ROW, let cid = sqlite3_column_text(stmt, 0) else {
                 throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
             }
-            existingMembers.insert(String(cString: cid))
+            members.insert(String(cString: cid))
         }
-
-        let expectedMembers = Set(volume.entries.keys)
-        if let existingEntryCount {
-            guard existingEntryCount == expectedMembers.count,
-                  existingMembers == expectedMembers else {
-                throw BrokerError.conflictingVolume(volume.root)
-            }
-        } else if !existingMembers.isEmpty {
-            throw BrokerError.conflictingVolume(volume.root)
-        }
+        return members
     }
 
     private func validateExistingContent(cid: String, data: Data) throws {
@@ -346,9 +323,13 @@ struct CASVolumeStore: VolumeStorer {
         }
     }
 
-    private func insertMetadata(root: String, entryCount: Int) throws {
+    /// Updates in place, never deletes, so retained rows naming the root stay.
+    private func upsertMetadata(root: String, entryCount: Int) throws {
         try connection.execBind(
-            "INSERT OR IGNORE INTO volume_metadata(root, entry_count) VALUES(?1, ?2)"
+            """
+            INSERT INTO volume_metadata(root, entry_count) VALUES(?1, ?2)
+            ON CONFLICT(root) DO UPDATE SET entry_count=excluded.entry_count
+            """
         ) { stmt in
             sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
             sqlite3_bind_int64(stmt, 2, Int64(entryCount))
@@ -383,6 +364,23 @@ struct CASVolumeStore: VolumeStorer {
         }
     }
 
+    private func deleteVolumeEntry(root: String, cid: String) throws {
+        try connection.execBind(
+            "DELETE FROM volume_entries WHERE root=?1 AND cid=?2"
+        ) { stmt in
+            sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+            sqlite3_bind_text(stmt, 2, cid, -1, SQLITE_TRANSIENT_SHIM)
+        }
+    }
+
+    private func deleteUnownedCASData(cid: String) throws {
+        try connection.execBind(
+            "DELETE FROM cas_data WHERE cid=?1 AND NOT EXISTS (SELECT 1 FROM volume_entries WHERE cid=?1)"
+        ) { stmt in
+            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+        }
+    }
+
     private func verifyComplete(root: String, entryCount: Int) throws {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
@@ -402,7 +400,7 @@ struct CASVolumeStore: VolumeStorer {
         sqlite3_bind_int64(stmt, 2, Int64(entryCount))
         let result = sqlite3_step(stmt)
         if result == SQLITE_ROW { return }
-        if result == SQLITE_DONE { throw BrokerError.conflictingVolume(root) }
+        if result == SQLITE_DONE { throw BrokerError.inconsistentState("Volume \(root) did not commit whole") }
         throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
     }
 }

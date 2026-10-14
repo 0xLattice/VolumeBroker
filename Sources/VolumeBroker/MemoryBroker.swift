@@ -57,35 +57,35 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         for volume in volumes { try volume.validate() }
         guard !volumes.isEmpty else { return }
         try lock.withWriteLock {
-            let newVolumes = try Self.preflight(volumes, state: state)
-            for volume in newVolumes {
-                state.membersByRoot[volume.root] = Set(volume.entries.keys)
+            let changed = try Self.preflight(volumes, state: state)
+            for volume in changed {
+                let members = Set(volume.entries.keys)
+                let previous = state.membersByRoot.updateValue(members, forKey: volume.root) ?? []
                 for (cid, data) in volume.entries {
                     state.contentByCID[cid] = data
                     state.ownersByCID[cid, default: []].insert(volume.root)
                 }
+                Self.dropOwner(volume.root, of: previous.subtracting(members), state: &state)
             }
         }
     }
 
+    /// A later Volume for a root, in the store or earlier in the batch,
+    /// replaces its entry list; the same list changes nothing.
     private static func preflight(_ volumes: [SerializedVolume], state: State) throws -> [SerializedVolume] {
-        var pendingMemberships: [String: Set<String>] = [:]
-        var pendingContent: [String: Data] = [:]
-        var newVolumes: [SerializedVolume] = []
-
+        var indexByRoot: [String: Int] = [:]
+        var latest: [SerializedVolume] = []
         for volume in volumes {
-            let members = Set(volume.entries.keys)
-            if let existing = pendingMemberships[volume.root] ?? state.membersByRoot[volume.root],
-               existing != members {
-                throw BrokerError.conflictingVolume(volume.root)
+            if let index = indexByRoot[volume.root] {
+                latest[index] = volume
+            } else {
+                indexByRoot[volume.root] = latest.count
+                latest.append(volume)
             }
-            if pendingMemberships[volume.root] == nil {
-                pendingMemberships[volume.root] = members
-                if state.membersByRoot[volume.root] == nil {
-                    newVolumes.append(volume)
-                }
-            }
+        }
 
+        var pendingContent: [String: Data] = [:]
+        for volume in latest {
             for (cid, data) in volume.entries {
                 if let existing = pendingContent[cid] ?? state.contentByCID[cid],
                    existing != data {
@@ -94,7 +94,7 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
                 pendingContent[cid] = data
             }
         }
-        return newVolumes
+        return latest.filter { state.membersByRoot[$0.root] != Set($0.entries.keys) }
     }
 
     private static func isComplete(root: String, state: State) -> Bool {
@@ -120,7 +120,12 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
 
     private static func removeVolume(root: String, state: inout State) {
         guard let members = state.membersByRoot.removeValue(forKey: root) else { return }
-        for cid in members {
+        dropOwner(root, of: members, state: &state)
+    }
+
+    /// Content no Volume lists any more is reclaimed.
+    private static func dropOwner(_ root: String, of cids: Set<String>, state: inout State) {
+        for cid in cids {
             var owners = state.ownersByCID[cid] ?? []
             owners.remove(root)
             if owners.isEmpty {

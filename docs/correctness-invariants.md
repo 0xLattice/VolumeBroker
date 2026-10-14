@@ -9,7 +9,7 @@ Retention never substitutes for publication.
 | VOLUME-002 | Every `(CID, bytes)` pair uses the repository's canonical CID spelling and validates using its declared digest length. |
 | VOLUME-003 | A batch owns a copied snapshot and publishes all valid Volumes or none. |
 | VOLUME-004 | Valid existing CID content cannot acquire different bytes; invalid local bytes may be repaired only by submitted bytes that authenticate to that CID. |
-| VOLUME-005 | An existing Volume root cannot acquire different membership. |
+| VOLUME-005 | A later store of an existing root with a different membership replaces it, in one transaction: a reader sees the old list or the new, never neither or a mix. The root's metadata row is updated, never deleted, so its retained rows stand. Members no Volume lists any more are reclaimed as a release reclaims them. Within one batch, the last Volume for a root wins. The same membership changes nothing. |
 | VOLUME-006 | Declared count, membership, and root membership must agree before publication. Foreign keys guarantee every member has a CAS row and metadata; the schema guarantees an integer, positive declared count. |
 | VOLUME-007 | Cashew completes one independently durable selected Volume per `VolumeStorer` callback; a caller with a preassembled all-or-none batch may use `storeVolumesLocal`. |
 | VOLUME-008 | Loose CAS rows and incomplete membership grant no visibility; requested bytes are returned only after CID validation. |
@@ -31,6 +31,6 @@ Retention never substitutes for publication.
 A read never writes: corruption only hides the corrupt bytes from readers, so a
 database error or a corrupt leaf can never shrink what a retained root keeps.
 
-Primary coverage: `VolumeIntegrityTests`, `MemoryBrokerTests`,
+Primary coverage: `VolumeIntegrityTests`, `ReplaceTests`, `MemoryBrokerTests`,
 `DiskBrokerTests`, `RetentionTests`, `SweepTests`,
 `SchemaVersionTests`, and `CashewProtocolTests`.

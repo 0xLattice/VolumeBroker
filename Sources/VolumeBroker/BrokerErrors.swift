@@ -12,7 +12,4 @@ public enum BrokerError: Error, Sendable, Equatable {
     /// content addressing this is corruption (or an impossible hash collision),
     /// never a benign overwrite.
     case conflictingContent(String)
-
-    /// A published Volume root cannot later name a different complete entry set.
-    case conflictingVolume(String)
 }

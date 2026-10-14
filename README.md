@@ -11,7 +11,10 @@ about chains.
 ## Contract
 
 - A Volume is visible only after its complete, CID-valid entry set commits.
-- Valid CID bytes and Volume membership are immutable.
+- Valid CID bytes are immutable.
+- A later store of a root replaces its entry list. On receipt only the root's
+  own bytes can be checked against what was asked for, so the first answer is
+  never final; entries no Volume lists any more are reclaimed.
 - Reads may fall through `local -> near -> far`; writes target one broker.
 - A retained root keeps its own Volume and nothing nested under it; `sweep`
   removes every Volume no scope retains.

@@ -121,6 +121,50 @@ final class ScopeCrashTests: XCTestCase {
         XCTAssertEqual(P.diskProblems(location.path), [])
     }
 
+    /// The process exits while a store replacing a retained root's entry list
+    /// is reclaiming the dropped padding: entries already swapped, no COMMIT.
+    func testAProcessThatDiesInsideAReplaceLeavesTheOldListWhole() async throws {
+        if sanitizerIsActive() { throw XCTSkip("instrumented xctest bundles cannot be re-launched through xcrun") }
+        let padded = P.volume("block", ["tx-a", "tx-b", "pad-1", "pad-2"])
+        let correct = P.volume("block", ["tx-a", "tx-b"])
+
+        if let childPath = ProcessInfo.processInfo.environment[Self.childPathKey] {
+            let connection = try SQLiteConnection(path: childPath)
+            let store = CASVolumeStore(connection: connection)
+            let retained = RetainedRootIndex(connection: connection)
+            try await store.store(volume: padded)
+            try await retained.mergeRetainedRoots(scope: Self.chain, roots: [padded.root])
+            sqlite3_set_authorizer(connection.db, { _, action, table, _, _, _ in
+                guard action == SQLITE_DELETE, let table, String(cString: table) == "cas_data" else { return SQLITE_OK }
+                Darwin._exit(0)
+            }, nil)
+            try await store.store(volume: correct)
+            Darwin._exit(3)
+        }
+
+        let location = try temporaryPath()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let (child, log) = try spawnChild(testName: "testAProcessThatDiesInsideAReplaceLeavesTheOldListWhole", path: location.path)
+        defer { try? FileManager.default.removeItem(at: log) }
+        try await wait(child, seconds: 30)
+        XCTAssertFalse(child.isRunning)
+        XCTAssertEqual(child.terminationStatus, 0, String(decoding: (try? Data(contentsOf: log)) ?? Data(), as: UTF8.self))
+
+        let reopened = try DiskBroker(path: location.path)
+        let before = await reopened.fetchVolumeLocal(root: padded.root)
+        XCTAssertEqual(before?.entries, padded.entries)
+        XCTAssertEqual(P.diskProblems(location.path), [])
+        XCTAssertEqual(P.tableCounts(location.path), [1, 5, 5, 1])
+
+        try await reopened.store(volume: correct)
+        let after = await reopened.fetchVolumeLocal(root: correct.root)
+        XCTAssertEqual(after?.entries, correct.entries)
+        let retainedRoots = try await reopened.retainedRoots(scope: Self.chain)
+        XCTAssertEqual(retainedRoots, [correct.root])
+        XCTAssertEqual(P.diskProblems(location.path), [])
+        XCTAssertEqual(P.tableCounts(location.path), [1, 3, 3, 1])
+    }
+
     /// Killed at an arbitrary moment in a run of store, merge, release.
     func testAProcessKilledAmongFetchesAndReleasesLeavesOnlyWhatAListingOrASweepFinds() async throws {
         if sanitizerIsActive() { throw XCTSkip("instrumented xctest bundles cannot be re-launched through xcrun") }
