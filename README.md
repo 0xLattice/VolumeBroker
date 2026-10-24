@@ -128,7 +128,8 @@ database path. Malformed v2 schemas fail closed.
 | Storage integrity | Application state, canonicity, and consensus |
 
 See [correctness invariants](docs/correctness-invariants.md) for the review
-contract.
+contract. Both are published at
+[lattice.build/docs](https://lattice.build/docs/protocol/volumebroker/).
 
 ## Requirements
 
