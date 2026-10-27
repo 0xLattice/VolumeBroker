@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "VolumeBroker", targets: ["VolumeBroker"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/adalinxx/cashew.git", exact: "5.0.3"),
+        .package(url: "https://github.com/0xLattice/cashew.git", exact: "5.0.3"),
         .package(url: "https://github.com/swift-libp2p/swift-cid.git", exact: "0.2.1"),
         .package(url: "https://github.com/swift-libp2p/swift-multihash.git", exact: "0.2.1"),
     ],
