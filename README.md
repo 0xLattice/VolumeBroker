@@ -1,7 +1,7 @@
 # VolumeBroker
 
 Atomic, Volume-granular content-addressed storage for
-[Cashew](https://github.com/adalinxx/cashew).
+[Cashew](https://github.com/0xLattice/cashew).
 
 A `SerializedVolume` is one root CID plus the exact `(CID, bytes)` entries
 published with it. VolumeBroker stores that set as one unit. It never walks DAG
