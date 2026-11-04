@@ -2,7 +2,7 @@ import Foundation
 
 /// In-memory twin of `DiskBroker` with identical store, retention, and sweep
 /// semantics.
-public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker {
+public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
     public let near: (any VolumeBroker)?
     public let far: (any VolumeBroker)?
 
@@ -13,6 +13,14 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
         /// Keyed by a scope name's bytes, as SQLite compares them: two
         /// spellings Swift calls equal are two scopes.
         var retainedRoots: [[UInt8]: Set<String>] = [:]
+        /// Counted scopes, keyed the same way: each count is above zero.
+        var countedRoots: [[UInt8]: [String: Int]] = [:]
+        var countedMarkers: [[UInt8]: String] = [:]
+
+        func isKept(_ root: String) -> Bool {
+            retainedRoots.values.contains { $0.contains(root) }
+                || countedRoots.values.contains { $0[root] != nil }
+        }
     }
 
     private let lock = RWLock()
@@ -170,8 +178,9 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
     @discardableResult
     public func sweep() async throws -> Int {
         lock.withWriteLock {
-            let retained = Set(state.retainedRoots.values.joined())
-            let dead = state.membersByRoot.keys.filter { !retained.contains($0) }
+            let kept = Set(state.retainedRoots.values.joined())
+                .union(state.countedRoots.values.flatMap(\.keys))
+            let dead = state.membersByRoot.keys.filter { !kept.contains($0) }
             for root in dead {
                 Self.removeVolume(root: root, state: &state)
             }
@@ -190,14 +199,17 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
                 retained.subtract(canonicalRoots)
                 state.retainedRoots[key] = retained.isEmpty ? nil : retained
             }
-            let dead = canonicalRoots.filter { root in
-                state.membersByRoot[root] != nil && !state.retainedRoots.values.contains { $0.contains(root) }
-            }
-            for root in dead {
-                Self.removeVolume(root: root, state: &state)
-            }
-            return dead.count
+            return Self.reclaim(roots: canonicalRoots, state: &state)
         }
+    }
+
+    /// Remove each of `roots` no scope retains or counts.
+    private static func reclaim(roots: [String], state: inout State) -> Int {
+        let dead = roots.filter { state.membersByRoot[$0] != nil && !state.isKept($0) }
+        for root in dead {
+            removeVolume(root: root, state: &state)
+        }
+        return dead.count
     }
 
     public func retainedScopes(prefix: String) async throws -> [String] {
@@ -207,6 +219,73 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootReleaseBroker 
                 .keys
                 .sorted { $0.lexicographicallyPrecedes($1) }
                 .map { String(decoding: $0, as: UTF8.self) }
+        }
+    }
+
+    // MARK: - Counted Roots
+
+    public func adjustCountedRoots(
+        scope: String,
+        deltas: [String: Int],
+        marker: String,
+        expectedMarker: String?
+    ) async throws {
+        try Self.validateScope(scope)
+        try CountedRootIndex.validateMarker(marker)
+        if let expectedMarker { try CountedRootIndex.validateMarker(expectedMarker) }
+        let roots = try Self.canonicalRetainedRoots(Array(deltas.keys))
+
+        try lock.withWriteLock {
+            let key = Array(scope.utf8)
+            let found = state.countedMarkers[key]
+            guard found.map({ Array($0.utf8) }) == expectedMarker.map({ Array($0.utf8) }) else {
+                throw BrokerError.countedMarkerMismatch(expected: expectedMarker, found: found)
+            }
+            var counts = state.countedRoots[key] ?? [:]
+            var missing: [String] = []
+            var zeroed: [String] = []
+            for root in roots {
+                guard let delta = deltas[root], delta != 0 else { continue }
+                let current = counts[root] ?? 0
+                let (count, overflow) = current.addingReportingOverflow(delta)
+                guard !overflow, count >= 0 else { throw BrokerError.negativeCount(root) }
+                if current == 0, count > 0, !Self.isComplete(root: root, state: state) {
+                    missing.append(root)
+                }
+                counts[root] = count == 0 ? nil : count
+                if count == 0 { zeroed.append(root) }
+            }
+            guard missing.isEmpty else { throw BrokerError.countedRootsMissing(missing) }
+            state.countedRoots[key] = counts.isEmpty ? nil : counts
+            state.countedMarkers[key] = marker
+            _ = Self.reclaim(roots: zeroed, state: &state)
+        }
+    }
+
+    public func countedRoots(scope: String) async throws -> [String: Int] {
+        lock.withReadLock { state.countedRoots[Array(scope.utf8)] ?? [:] }
+    }
+
+    public func countedMarker(scope: String) async throws -> String? {
+        lock.withReadLock { state.countedMarkers[Array(scope.utf8)] }
+    }
+
+    public func countedScopes(prefix: String) async throws -> [String] {
+        lock.withReadLock {
+            state.countedMarkers.keys
+                .filter { $0.starts(with: prefix.utf8) }
+                .sorted { $0.lexicographicallyPrecedes($1) }
+                .map { String(decoding: $0, as: UTF8.self) }
+        }
+    }
+
+    public func dropCountedScope(scope: String) async throws {
+        try Self.validateScope(scope)
+        lock.withWriteLock {
+            let key = Array(scope.utf8)
+            let roots = (state.countedRoots.removeValue(forKey: key) ?? [:]).keys.sorted()
+            state.countedMarkers.removeValue(forKey: key)
+            _ = Self.reclaim(roots: roots, state: &state)
         }
     }
 

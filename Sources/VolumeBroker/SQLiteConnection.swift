@@ -191,6 +191,7 @@ final class SQLiteConnection: @unchecked Sendable {
         do {
             let foundVersion = try scalarInt(db: db, "PRAGMA user_version")
             if foundVersion == schemaVersion {
+                try createAdditiveSchemaIfMissing(db: db)
                 try validateSchema(db: db)
             } else {
                 guard foundVersion == 0 else {
@@ -256,7 +257,44 @@ final class SQLiteConnection: @unchecked Sendable {
         ("idx_retained_roots_root", "CREATE INDEX idx_retained_roots_root ON retained_roots(root)"),
     ]
 
+    /// Tables added within v2. Opening a v2 store that lacks them creates
+    /// them, at the same version. They hold no foreign key, so a binary that
+    /// predates them still opens the store: its validation accepts any other
+    /// table that holds no foreign key into the tables it owns.
+    private static let additiveTableSchemas: [(name: String, sql: String)] = [
+        ("counted_roots", """
+            CREATE TABLE counted_roots (
+                scope TEXT NOT NULL,
+                root TEXT NOT NULL,
+                count INTEGER NOT NULL
+                    CHECK (typeof(count) = 'integer' AND count > 0),
+                PRIMARY KEY (scope, root)
+            )
+            """),
+        ("counted_markers", """
+            CREATE TABLE counted_markers (
+                scope TEXT PRIMARY KEY,
+                marker TEXT NOT NULL
+            )
+            """),
+    ]
+
+    private static let additiveIndexSchemas: [(name: String, sql: String)] = [
+        ("idx_counted_roots_root", "CREATE INDEX idx_counted_roots_root ON counted_roots(root)"),
+    ]
+
+    private static func createAdditiveSchemaIfMissing(db: OpaquePointer) throws {
+        for table in additiveTableSchemas where schemaSQL(db: db, type: "table", name: table.name) == nil {
+            try execRaw(db: db, table.sql)
+        }
+        for index in additiveIndexSchemas where schemaSQL(db: db, type: "index", name: index.name) == nil {
+            try execRaw(db: db, index.sql)
+        }
+    }
+
     private static func validateSchema(db: OpaquePointer) throws {
+        let tableSchemas = tableSchemas + additiveTableSchemas
+        let indexSchemas = indexSchemas + additiveIndexSchemas
         for table in tableSchemas {
             guard let stored = schemaSQL(db: db, type: "table", name: table.name),
                   canonicalSQL(stored) == canonicalSQL(table.sql) else {
@@ -388,7 +426,7 @@ final class SQLiteConnection: @unchecked Sendable {
     }
 
     private static func createTables(db: OpaquePointer) throws {
-        for table in tableSchemas { try execRaw(db: db, table.sql) }
-        for index in indexSchemas { try execRaw(db: db, index.sql) }
+        for table in tableSchemas + additiveTableSchemas { try execRaw(db: db, table.sql) }
+        for index in indexSchemas + additiveIndexSchemas { try execRaw(db: db, index.sql) }
     }
 }

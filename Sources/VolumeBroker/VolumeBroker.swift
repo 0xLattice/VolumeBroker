@@ -24,7 +24,8 @@ public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
 ///
 /// A Volume is kept if a scope retains its root, and only then: retaining a
 /// root does not keep a Volume nested under it. `sweep` removes every Volume
-/// no scope retains and then every CAS row no surviving Volume owns.
+/// no scope retains and then every CAS row no surviving Volume owns. A broker
+/// that also counts roots (`CountedRootBroker`) keeps a counted Volume too.
 ///
 /// Storing does not retain. Content stored but not yet named by a retained
 /// root is removed by the next `sweep`; a later advance naming it is then
@@ -63,6 +64,45 @@ public protocol RetainedRootReleaseBroker: RetainedRootMergeBroker {
     /// `prefix`, sorted. A caller that keeps one scope per thing it holds
     /// finds the scopes it no longer has a reason for.
     func retainedScopes(prefix: String) async throws -> [String]
+}
+
+/// Optional retention surface of counted roots: per scope, a count for each
+/// root and one marker, changed together in one transaction.
+///
+/// A Volume is kept while any scope counts it (a count above zero) or any
+/// scope retains it. Counted scopes are a namespace of their own, apart from
+/// retained scopes. Every scope that counts something has a marker, since
+/// every adjustment writes one.
+public protocol CountedRootBroker: RetainedRootReleaseBroker {
+    /// In one transaction: add `deltas` to `scope`'s counts and set its
+    /// marker to `marker`. Refused whole, with nothing changed, when the
+    /// scope's marker is not `expectedMarker` (`nil` for no marker), when a
+    /// count would go below zero, or when a root whose count would go from
+    /// zero above zero is not a complete stored Volume (the error lists every
+    /// such root). Zero deltas are ignored. A root whose count reaches zero
+    /// leaves the scope, and is then removed, with the CAS rows that leaves
+    /// unowned, if no scope counts or retains it.
+    func adjustCountedRoots(
+        scope: String,
+        deltas: [String: Int],
+        marker: String,
+        expectedMarker: String?
+    ) async throws
+
+    /// Every root `scope` counts, with its count above zero.
+    func countedRoots(scope: String) async throws -> [String: Int]
+
+    /// `scope`'s marker, or `nil` if it has none.
+    func countedMarker(scope: String) async throws -> String?
+
+    /// The scopes with a marker whose name starts with `prefix`, sorted, by
+    /// the same byte rules as `retainedScopes(prefix:)`.
+    func countedScopes(prefix: String) async throws -> [String]
+
+    /// In one transaction: delete `scope`'s counts and marker, then remove
+    /// each Volume it counted that no scope counts or retains, with the CAS
+    /// rows that leaves unowned.
+    func dropCountedScope(scope: String) async throws
 }
 
 public extension VolumeBroker {

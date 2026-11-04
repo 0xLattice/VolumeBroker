@@ -13,8 +13,8 @@ about chains.
 - A Volume is visible only after its complete, CID-valid entry set commits.
 - Valid CID bytes and Volume membership are immutable.
 - Reads may fall through `local -> near -> far`; writes target one broker.
-- A retained root keeps its own Volume and nothing nested under it; `sweep`
-  removes every Volume no scope retains.
+- A retained or counted root keeps its own Volume and nothing nested under it;
+  `sweep` removes every Volume no scope retains or counts.
 - Equal CIDs are deduplicated within each broker tier.
 
 One cascade is one storage domain. Use separate brokers or database paths when
@@ -105,9 +105,42 @@ has a reason for.
   them removes what was stored, and the retain is then refused whole with
   `missingRetainedRoot`: store again and retry.
 
+### Counted roots
+
+A `CountedRootBroker` also keeps, per scope, a count for each root and one
+marker, and changes them together:
+
+```swift
+try await disk.adjustCountedRoots(
+    scope: "state", deltas: [newNode: 1, oldNode: -1],
+    marker: "block-12", expectedMarker: "block-11")
+```
+
+The adjustment is one transaction and is refused whole, with nothing changed,
+when the scope's marker is not `expectedMarker` (`nil` for none,
+`countedMarkerMismatch`), when a count would go below zero (`negativeCount`),
+or when a root would start being counted and is not a complete stored Volume
+(`countedRootsMissing`, listing every such root). Zero deltas are ignored. A
+root whose count reaches zero leaves the scope and, if no scope counts or
+retains it, is removed with the CAS rows that leaves unowned. The marker lets
+a caller keep its own cursor in the same commit as its counts.
+
+A Volume is kept while any scope counts it or any scope retains it: release,
+sweep, adjustment and drop all check both. Counted scopes are a namespace of
+their own. `countedRoots(scope:)` and `countedMarker(scope:)` read one scope,
+`countedScopes(prefix:)` lists the scopes with a marker by the same byte rules
+as `retainedScopes(prefix:)`, and `dropCountedScope(scope:)` deletes a scope's
+counts and marker and reclaims what nothing else keeps.
+
+- The counted tables hold no foreign key, so a binary that predates them still
+  opens the store. That binary's release and sweep do not see counts and may
+  remove a counted Volume. On the next open, a scope that counts a root no
+  longer stored loses its counts and its marker, and its owner starts it again.
+
 ## Implementations
 
-- `MemoryBroker` is the in-memory twin with identical retention semantics.
+- `MemoryBroker` is the in-memory twin with identical retention and counting
+  semantics.
 - `DiskBroker` uses SQLite, WAL, foreign keys, and schema v2 validation. With
   `synchronous=FULL`, each commit is fsynced to the WAL before it returns, so a
   `store` that returns survives a crash.
@@ -116,7 +149,8 @@ has a reason for.
 
 `DiskBroker` initializes only an empty v0 database. Any other version, including
 v1 (owner/count pins), fails closed with `migrationRequired`; rebuild from a new
-database path. Malformed v2 schemas fail closed.
+database path. Malformed v2 schemas fail closed. A v2 store without the counted
+tables gets them on open, at the same version.
 
 ## Boundary
 
@@ -124,7 +158,7 @@ database path. Malformed v2 schemas fail closed.
 | --- | --- |
 | Volume validation and atomic publication | DAG traversal and Volume selection |
 | Local CAS, read cascading, and the sweep | Storage placement and domain isolation |
-| Retained-root sets | Which roots are retained, and when to sweep |
+| Retained-root sets and counted roots | Which roots are retained or counted, and when to sweep |
 | Storage integrity | Application state, canonicity, and consensus |
 
 See [correctness invariants](docs/correctness-invariants.md) for the review
