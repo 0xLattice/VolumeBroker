@@ -68,9 +68,9 @@ try await disk.advanceRetainedRoots(scope: "canonical", roots: [stateRoot])
 `mergeRetainedRoots` adds roots without replacing the set. Replacing a scope
 with the same set and merging roots already in it are naturally idempotent.
 
-A Volume is kept if a scope retains its root, and only then. Retaining a root
-does not keep a Volume nested under it: a caller that wants one kept retains
-its root too.
+A Volume is kept if a scope retains or counts its root (see Counted roots),
+and only then. Retaining a root does not keep a Volume nested under it: a
+caller that wants one kept retains its root too.
 
 ```swift
 let removed = try await disk.sweep()
@@ -118,16 +118,19 @@ try await disk.adjustCountedRoots(
 
 The adjustment is one transaction and is refused whole, with nothing changed,
 when the scope's marker is not `expectedMarker` (`nil` for none,
-`countedMarkerMismatch`), when a count would go below zero (`negativeCount`),
-or when a root would start being counted and is not a complete stored Volume
-(`countedRootsMissing`, listing every such root). Zero deltas are ignored. A
+`countedMarkerMismatch`), when a count would go below zero (`negativeCount`)
+or past `Int.max` (`countedRootOverflow`), or when a root would start being
+counted and is not a complete stored Volume (`countedRootsMissing`, listing
+every such root). Zero deltas are ignored. A
 root whose count reaches zero leaves the scope and, if no scope counts or
 retains it, is removed with the CAS rows that leaves unowned. The marker lets
 a caller keep its own cursor in the same commit as its counts.
 
 A Volume is kept while any scope counts it or any scope retains it: release,
 sweep, adjustment and drop all check both. Counted scopes are a namespace of
-their own. `countedRoots(scope:)` and `countedMarker(scope:)` read one scope,
+their own. `countedState(scope:)` reads one scope's marker and counts from one
+snapshot: an adjustment computed from those counts passes that marker as
+`expectedMarker`, so it applies only to the counts it was computed from.
 `countedScopes(prefix:)` lists the scopes with a marker by the same byte rules
 as `retainedScopes(prefix:)`, and `dropCountedScope(scope:)` deletes a scope's
 counts and marker and reclaims what nothing else keeps.
@@ -136,6 +139,8 @@ counts and marker and reclaims what nothing else keeps.
   opens the store. That binary's release and sweep do not see counts and may
   remove a counted Volume. On the next open, a scope that counts a root no
   longer stored loses its counts and its marker, and its owner starts it again.
+  Until it does, the Volumes that scope counted are kept only if something
+  else retains or counts them.
 
 ## Implementations
 

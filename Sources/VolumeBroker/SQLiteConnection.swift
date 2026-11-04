@@ -283,12 +283,18 @@ final class SQLiteConnection: @unchecked Sendable {
         ("idx_counted_roots_root", "CREATE INDEX idx_counted_roots_root ON counted_roots(root)"),
     ]
 
+    /// An object of another kind under one of these names is a malformed
+    /// schema, not something to create beside.
     private static func createAdditiveSchemaIfMissing(db: OpaquePointer) throws {
-        for table in additiveTableSchemas where schemaSQL(db: db, type: "table", name: table.name) == nil {
-            try execRaw(db: db, table.sql)
-        }
-        for index in additiveIndexSchemas where schemaSQL(db: db, type: "index", name: index.name) == nil {
-            try execRaw(db: db, index.sql)
+        let objects = additiveTableSchemas.map { ("table", $0) } + additiveIndexSchemas.map { ("index", $0) }
+        for (type, object) in objects where schemaSQL(db: db, type: type, name: object.name) == nil {
+            guard try scalarInt(
+                db: db,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name='\(object.name)' COLLATE NOCASE"
+            ) == 0 else {
+                throw BrokerError.invalidSchema(version: schemaVersion)
+            }
+            try execRaw(db: db, object.sql)
         }
     }
 

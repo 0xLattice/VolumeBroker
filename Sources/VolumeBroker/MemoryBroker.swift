@@ -248,7 +248,8 @@ public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
                 guard let delta = deltas[root], delta != 0 else { continue }
                 let current = counts[root] ?? 0
                 let (count, overflow) = current.addingReportingOverflow(delta)
-                guard !overflow, count >= 0 else { throw BrokerError.negativeCount(root) }
+                guard !overflow else { throw BrokerError.countedRootOverflow(root) }
+                guard count >= 0 else { throw BrokerError.negativeCount(root) }
                 if current == 0, count > 0, !Self.isComplete(root: root, state: state) {
                     missing.append(root)
                 }
@@ -262,12 +263,11 @@ public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
         }
     }
 
-    public func countedRoots(scope: String) async throws -> [String: Int] {
-        lock.withReadLock { state.countedRoots[Array(scope.utf8)] ?? [:] }
-    }
-
-    public func countedMarker(scope: String) async throws -> String? {
-        lock.withReadLock { state.countedMarkers[Array(scope.utf8)] }
+    public func countedState(scope: String) async throws -> (marker: String?, counts: [String: Int]) {
+        lock.withReadLock {
+            let key = Array(scope.utf8)
+            return (state.countedMarkers[key], state.countedRoots[key] ?? [:])
+        }
     }
 
     public func countedScopes(prefix: String) async throws -> [String] {

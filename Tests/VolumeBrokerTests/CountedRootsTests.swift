@@ -58,10 +58,10 @@ struct CountedRootsTests {
         try await broker.adjustCountedRoots(
             scope: "s", deltas: Self.counts(["a": 1, "b": -1]), marker: "m2", expectedMarker: "m1")
 
-        #expect(try await broker.countedRoots(scope: "s") == Self.counts(["a": 2, "b": 1]))
-        #expect(try await broker.countedMarker(scope: "s") == "m2")
-        #expect(try await broker.countedMarker(scope: "other") == nil)
-        #expect(try await broker.countedRoots(scope: "other") == [:])
+        #expect(try await broker.countedState(scope: "s").counts == Self.counts(["a": 2, "b": 1]))
+        #expect(try await broker.countedState(scope: "s").marker == "m2")
+        #expect(try await broker.countedState(scope: "other").marker == nil)
+        #expect(try await broker.countedState(scope: "other").counts == [:])
         // Counted scopes are not retained scopes.
         #expect(try await broker.retainedScopes(prefix: "") == [])
         #expect(try await broker.retainedRoots(scope: "s") == [])
@@ -88,8 +88,8 @@ struct CountedRootsTests {
             try await broker.adjustCountedRoots(
                 scope: "s", deltas: Self.counts(["a": -1]), marker: "m2", expectedMarker: "m9")
         }
-        #expect(try await broker.countedRoots(scope: "s") == Self.counts(["a": 1]))
-        #expect(try await broker.countedMarker(scope: "s") == "m1")
+        #expect(try await broker.countedState(scope: "s").counts == Self.counts(["a": 1]))
+        #expect(try await broker.countedState(scope: "s").marker == "m1")
         #expect(await broker.hasVolume(root: Self.cid("a")))
     }
 
@@ -108,8 +108,8 @@ struct CountedRootsTests {
             try await broker.adjustCountedRoots(
                 scope: "s", deltas: Self.counts(["c": -1]), marker: "m2", expectedMarker: "m1")
         }
-        #expect(try await broker.countedRoots(scope: "s") == Self.counts(["a": 1, "b": 1]))
-        #expect(try await broker.countedMarker(scope: "s") == "m1")
+        #expect(try await broker.countedState(scope: "s").counts == Self.counts(["a": 1, "b": 1]))
+        #expect(try await broker.countedState(scope: "s").marker == "m1")
         // `a` would have reached zero: it was not reclaimed.
         #expect(await broker.hasVolume(root: Self.cid("a")))
     }
@@ -127,8 +127,8 @@ struct CountedRootsTests {
                 scope: "s", deltas: Self.counts(["a": 1, "b": -1, "x": 1, "y": 3]),
                 marker: "m2", expectedMarker: "m1")
         }
-        #expect(try await broker.countedRoots(scope: "s") == Self.counts(["b": 1]))
-        #expect(try await broker.countedMarker(scope: "s") == "m1")
+        #expect(try await broker.countedState(scope: "s").counts == Self.counts(["b": 1]))
+        #expect(try await broker.countedState(scope: "s").marker == "m1")
         #expect(await broker.hasVolume(root: Self.cid("b")))
 
         // Stored, the same adjustment goes through.
@@ -136,7 +136,7 @@ struct CountedRootsTests {
         try await broker.adjustCountedRoots(
             scope: "s", deltas: Self.counts(["a": 1, "b": -1, "x": 1, "y": 3]),
             marker: "m2", expectedMarker: "m1")
-        #expect(try await broker.countedRoots(scope: "s") == Self.counts(["a": 1, "x": 1, "y": 3]))
+        #expect(try await broker.countedState(scope: "s").counts == Self.counts(["a": 1, "x": 1, "y": 3]))
     }
 
     @Test(arguments: Kind.allCases)
@@ -148,8 +148,8 @@ struct CountedRootsTests {
             scope: "s", deltas: Self.counts(["a": 1, "never": 0]), marker: "m1", expectedMarker: nil)
         try await broker.adjustCountedRoots(
             scope: "s", deltas: Self.counts(["a": 0]), marker: "m2", expectedMarker: "m1")
-        #expect(try await broker.countedRoots(scope: "s") == Self.counts(["a": 1]))
-        #expect(try await broker.countedMarker(scope: "s") == "m2")
+        #expect(try await broker.countedState(scope: "s").counts == Self.counts(["a": 1]))
+        #expect(try await broker.countedState(scope: "s").marker == "m2")
     }
 
     @Test(arguments: Kind.allCases)
@@ -172,7 +172,7 @@ struct CountedRootsTests {
             scope: "c", deltas: Self.counts(["alone": -1, "retained": -1, "twice": -1]),
             marker: "m2", expectedMarker: "m1")
 
-        #expect(try await broker.countedRoots(scope: "c") == Self.counts(["kept": 1]))
+        #expect(try await broker.countedState(scope: "c").counts == Self.counts(["kept": 1]))
         #expect(await broker.hasVolume(root: Self.cid("alone")) == false)
         #expect(await broker.fetchDataLocal(cid: Self.cid("alone-leaf")) == nil)
         // Bytes a surviving Volume owns stay.
@@ -186,7 +186,7 @@ struct CountedRootsTests {
             scope: "c2", deltas: Self.counts(["twice": -2]), marker: "n2", expectedMarker: "n1")
         #expect(await broker.hasVolume(root: Self.cid("twice")) == false)
         #expect(await broker.fetchDataLocal(cid: Self.cid("twice-leaf")) == nil)
-        #expect(try await broker.countedRoots(scope: "c2") == [:])
+        #expect(try await broker.countedState(scope: "c2").counts == [:])
         // A scope with a marker and no counts is still a scope.
         #expect(try await broker.countedScopes(prefix: "") == ["c", "c2"])
     }
@@ -225,8 +225,8 @@ struct CountedRootsTests {
 
         try await broker.dropCountedScope(scope: "c1")
 
-        #expect(try await broker.countedRoots(scope: "c1") == [:])
-        #expect(try await broker.countedMarker(scope: "c1") == nil)
+        #expect(try await broker.countedState(scope: "c1").counts == [:])
+        #expect(try await broker.countedState(scope: "c1").marker == nil)
         #expect(try await broker.countedScopes(prefix: "") == ["c2"])
         #expect(await broker.hasVolume(root: Self.cid("alone")) == false)
         #expect(await broker.fetchDataLocal(cid: Self.cid("alone-leaf")) == nil)
@@ -240,7 +240,7 @@ struct CountedRootsTests {
         try await broker.dropCountedScope(scope: "c1")
         try await broker.adjustCountedRoots(
             scope: "c1", deltas: Self.counts(["shared": 1]), marker: "m1", expectedMarker: nil)
-        #expect(try await broker.countedRoots(scope: "c1") == Self.counts(["shared": 1]))
+        #expect(try await broker.countedState(scope: "c1").counts == Self.counts(["shared": 1]))
     }
 
     @Test(arguments: Kind.allCases)
@@ -280,9 +280,6 @@ struct CountedRootsTests {
             ("s\0t", [a: 1], "m", nil),
             ("s", ["": 1], "m", nil),
             ("s", [a + "\0junk": 1], "m", nil),
-            ("s", [a: 1], "", nil),
-            ("s", [a: 1], "m\0n", nil),
-            ("s", [a: 1], "m", "m\0n"),
         ]
         for call in refused {
             await #expect(throws: BrokerError.self) {
@@ -290,11 +287,87 @@ struct CountedRootsTests {
                     scope: call.scope, deltas: call.deltas, marker: call.marker, expectedMarker: call.expected)
             }
         }
+        let badMarkers: [(marker: String, expected: String?)] = [("", nil), ("m\0n", nil), ("m", ""), ("m", "m\0n")]
+        for call in badMarkers {
+            do {
+                try await broker.adjustCountedRoots(
+                    scope: "s", deltas: [a: 1], marker: call.marker, expectedMarker: call.expected)
+                Issue.record("marker \(call) must be refused")
+            } catch BrokerError.invalidCountedMarker {
+            } catch {
+                Issue.record("marker \(call) refused with \(error)")
+            }
+        }
         await #expect(throws: BrokerError.self) { try await broker.dropCountedScope(scope: "") }
         await #expect(throws: BrokerError.self) { try await broker.dropCountedScope(scope: "s\0t") }
         #expect(try await broker.countedScopes(prefix: "") == [])
-        #expect(try await broker.countedRoots(scope: "s\0t") == [:])
-        #expect(try await broker.countedMarker(scope: "s\0t") == nil)
+        #expect(try await broker.countedState(scope: "s\0t").counts == [:])
+        #expect(try await broker.countedState(scope: "s\0t").marker == nil)
+    }
+
+    @Test(arguments: Kind.allCases)
+    func aCountPastIntMaxIsRefusedAsOverflow(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("a")])
+        try await broker.adjustCountedRoots(
+            scope: "s", deltas: Self.counts(["a": Int.max]), marker: "m1", expectedMarker: nil)
+        #expect(try await broker.countedState(scope: "s").counts == Self.counts(["a": Int.max]))
+        await #expect(throws: BrokerError.countedRootOverflow(Self.cid("a"))) {
+            try await broker.adjustCountedRoots(
+                scope: "s", deltas: Self.counts(["a": 1]), marker: "m2", expectedMarker: "m1")
+        }
+        let state = try await broker.countedState(scope: "s")
+        #expect(state.marker == "m1")
+        #expect(state.counts == Self.counts(["a": Int.max]))
+    }
+
+    /// Writers racing from one marker: exactly one wins.
+    @Test(arguments: Kind.allCases)
+    func concurrentAdjustmentsFromOneMarkerHaveOneWinner(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("a")])
+        let deltas = Self.counts(["a": 1])
+        let wins = await withTaskGroup(of: Bool.self) { group in
+            for i in 0..<50 {
+                group.addTask {
+                    (try? await broker.adjustCountedRoots(
+                        scope: "s", deltas: deltas, marker: "m\(i)", expectedMarker: nil)) != nil
+                }
+            }
+            var wins = 0
+            for await won in group where won { wins += 1 }
+            return wins
+        }
+        #expect(wins == 1)
+        #expect(try await broker.countedState(scope: "s").counts == deltas)
+    }
+
+    /// Each adjustment sets the marker to the count it leaves: every read,
+    /// taken while they run, sees a marker and counts from the same commit.
+    @Test(arguments: Kind.allCases)
+    func aStateReadSeesTheMarkerWithItsCounts(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("a")])
+        let a = Self.cid("a")
+        try await broker.adjustCountedRoots(scope: "s", deltas: [a: 1], marker: "1", expectedMarker: nil)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for count in 2...200 {
+                    try await broker.adjustCountedRoots(
+                        scope: "s", deltas: [a: 1], marker: "\(count)", expectedMarker: "\(count - 1)")
+                }
+            }
+            for _ in 0..<4 {
+                group.addTask {
+                    for _ in 0..<200 {
+                        let state = try await broker.countedState(scope: "s")
+                        #expect(state.marker == state.counts[a].map(String.init))
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+        #expect(try await broker.countedState(scope: "s").counts == [a: 200])
     }
 
     // MARK: - SQLite store
@@ -338,8 +411,8 @@ struct CountedRootsTests {
                 scope: "x:counted", deltas: Self.counts(["a": 2, "b": 1]), marker: "m1", expectedMarker: nil)
         }
         let reopened = try DiskBroker(path: path)
-        #expect(try await reopened.countedRoots(scope: "x:counted") == Self.counts(["a": 2, "b": 1]))
-        #expect(try await reopened.countedMarker(scope: "x:counted") == "m1")
+        #expect(try await reopened.countedState(scope: "x:counted").counts == Self.counts(["a": 2, "b": 1]))
+        #expect(try await reopened.countedState(scope: "x:counted").marker == "m1")
         #expect(try await reopened.countedScopes(prefix: "x:") == ["x:counted"])
         #expect(try await reopened.sweep() == 0)
         #expect(await reopened.hasVolume(root: Self.cid("a")))
@@ -372,7 +445,7 @@ struct CountedRootsTests {
         #expect(try await reopened.retainedRoots(scope: "r") == [Self.cid("a")])
         try await reopened.adjustCountedRoots(
             scope: "c", deltas: Self.counts(["a": 1]), marker: "m1", expectedMarker: nil)
-        #expect(try await reopened.countedRoots(scope: "c") == Self.counts(["a": 1]))
+        #expect(try await reopened.countedState(scope: "c").counts == Self.counts(["a": 1]))
     }
 
     /// The validation of the binary before counted roots, verbatim: the
@@ -413,6 +486,66 @@ struct CountedRootsTests {
             // No foreign key at all, so none can hold back an older binary's deletes.
             #expect(try Self.scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_list('counted_roots')") == 0)
             #expect(try Self.scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_list('counted_markers')") == 0)
+        }
+    }
+
+    /// A SQL failure late in an adjustment, at the marker write or in the
+    /// reclaim's CAS delete, rolls back everything before it.
+    @Test func aSQLFailureMidAdjustmentRollsBackEverything() async throws {
+        let path = Self.path()
+        let broker = try DiskBroker(path: path)
+        try await broker.storeVolumesLocal([Self.volume("a", ["leaf"]), Self.volume("b")])
+        try await broker.adjustCountedRoots(
+            scope: "s", deltas: Self.counts(["a": 1]), marker: "m1", expectedMarker: nil)
+
+        try Self.withDatabase(at: path) { db throws in
+            try Self.execute(db, """
+                CREATE TRIGGER fail_marker BEFORE UPDATE ON counted_markers
+                BEGIN SELECT RAISE(ABORT, 'marker'); END
+                """)
+        }
+        await #expect(throws: BrokerError.self) {
+            try await broker.adjustCountedRoots(
+                scope: "s", deltas: Self.counts(["a": -1, "b": 1]), marker: "m2", expectedMarker: "m1")
+        }
+        try Self.withDatabase(at: path) { db throws in
+            try Self.execute(db, "DROP TRIGGER fail_marker")
+            try Self.execute(db, """
+                CREATE TRIGGER fail_cas BEFORE DELETE ON cas_data
+                BEGIN SELECT RAISE(ABORT, 'cas'); END
+                """)
+        }
+        await #expect(throws: BrokerError.self) {
+            try await broker.adjustCountedRoots(
+                scope: "s", deltas: Self.counts(["a": -1]), marker: "m2", expectedMarker: "m1")
+        }
+        try Self.withDatabase(at: path) { db throws in
+            try Self.execute(db, "DROP TRIGGER fail_cas")
+        }
+
+        let state = try await broker.countedState(scope: "s")
+        #expect(state.marker == "m1")
+        #expect(state.counts == Self.counts(["a": 1]))
+        #expect(await broker.hasVolume(root: Self.cid("a")))
+        #expect(await broker.fetchDataLocal(cid: Self.cid("leaf")) == Data("leaf".utf8))
+    }
+
+    @Test(arguments: [
+        "CREATE VIEW counted_markers AS SELECT 1 AS scope, 2 AS marker",
+        "CREATE VIEW COUNTED_ROOTS AS SELECT 1 AS scope",
+        "CREATE INDEX idx_counted_roots_root ON retained_roots(scope)",
+    ])
+    func anotherObjectUnderACountedNameIsRejected(sql: String) async throws {
+        let path = Self.path()
+        _ = try DiskBroker(path: path)
+        try Self.withDatabase(at: path) { db throws in
+            try Self.execute(db, "DROP INDEX idx_counted_roots_root")
+            try Self.execute(db, "DROP TABLE counted_roots")
+            try Self.execute(db, "DROP TABLE counted_markers")
+            try Self.execute(db, sql)
+        }
+        #expect(throws: BrokerError.invalidSchema(version: 2)) {
+            _ = try DiskBroker(path: path)
         }
     }
 
@@ -459,10 +592,10 @@ struct CountedRootsTests {
         let reopened = try DiskBroker(path: path)
         #expect(await reopened.hasVolume(root: Self.cid("gone")) == false)
         #expect(try await reopened.countedScopes(prefix: "") == ["fine"])
-        #expect(try await reopened.countedRoots(scope: "broken") == [:])
-        #expect(try await reopened.countedMarker(scope: "broken") == nil)
-        #expect(try await reopened.countedRoots(scope: "fine") == Self.counts(["kept": 1]))
-        #expect(try await reopened.countedMarker(scope: "fine") == "n1")
+        #expect(try await reopened.countedState(scope: "broken").counts == [:])
+        #expect(try await reopened.countedState(scope: "broken").marker == nil)
+        #expect(try await reopened.countedState(scope: "fine").counts == Self.counts(["kept": 1]))
+        #expect(try await reopened.countedState(scope: "fine").marker == "n1")
         // The dropped scope starts again from no marker.
         try await reopened.storeVolumesLocal([Self.volume("gone", ["gone-leaf"])])
         try await reopened.adjustCountedRoots(

@@ -22,10 +22,10 @@ public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
 
 /// Retention surface: named scopes of retained Volume roots.
 ///
-/// A Volume is kept if a scope retains its root, and only then: retaining a
-/// root does not keep a Volume nested under it. `sweep` removes every Volume
-/// no scope retains and then every CAS row no surviving Volume owns. A broker
-/// that also counts roots (`CountedRootBroker`) keeps a counted Volume too.
+/// A Volume is kept if a scope retains or counts its root, and only then:
+/// retaining or counting a root does not keep a Volume nested under it.
+/// `sweep` removes every Volume no scope retains or counts and then every
+/// CAS row no surviving Volume owns. Only a `CountedRootBroker` counts.
 ///
 /// Storing does not retain. Content stored but not yet named by a retained
 /// root is removed by the next `sweep`; a later advance naming it is then
@@ -79,9 +79,10 @@ public protocol CountedRootBroker: RetainedRootReleaseBroker {
     /// scope's marker is not `expectedMarker` (`nil` for no marker), when a
     /// count would go below zero, or when a root whose count would go from
     /// zero above zero is not a complete stored Volume (the error lists every
-    /// such root). Zero deltas are ignored. A root whose count reaches zero
-    /// leaves the scope, and is then removed, with the CAS rows that leaves
-    /// unowned, if no scope counts or retains it.
+    /// such root). A count past `Int.max` is refused too. Zero deltas are
+    /// ignored. A root whose count reaches zero leaves the scope, and is then
+    /// removed, with the CAS rows that leaves unowned, if no scope counts or
+    /// retains it.
     func adjustCountedRoots(
         scope: String,
         deltas: [String: Int],
@@ -89,11 +90,11 @@ public protocol CountedRootBroker: RetainedRootReleaseBroker {
         expectedMarker: String?
     ) async throws
 
-    /// Every root `scope` counts, with its count above zero.
-    func countedRoots(scope: String) async throws -> [String: Int]
-
-    /// `scope`'s marker, or `nil` if it has none.
-    func countedMarker(scope: String) async throws -> String?
+    /// `scope`'s marker (`nil` if it has none) and every root it counts, with
+    /// its count above zero, read from one snapshot. An adjustment computed
+    /// from these counts passes this marker as `expectedMarker`: it then
+    /// applies only to the counts it was computed from.
+    func countedState(scope: String) async throws -> (marker: String?, counts: [String: Int])
 
     /// The scopes with a marker whose name starts with `prefix`, sorted, by
     /// the same byte rules as `retainedScopes(prefix:)`.

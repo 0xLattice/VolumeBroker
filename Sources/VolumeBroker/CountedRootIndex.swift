@@ -15,11 +15,11 @@ struct CountedRootIndex {
     /// A binary that predates counted roots does not see them, so after a
     /// rollback its release or sweep may have removed a Volume a scope still
     /// counts. Such a scope loses its counts and its marker, and its owner
-    /// starts it again. Run once on open, before any other use of the
-    /// connection. Each counted row costs one lookup.
+    /// starts it again; until it does, the Volumes the scope counted are kept
+    /// only if something else retains or counts them. Run once on open, before any other use of the connection.
+    /// The check costs one lookup per counted row and writes nothing; the
+    /// deletes run only when it finds a scope to drop.
     func dropScopesCountingMissingRoots() throws {
-        // Markers first: the second statement still finds the same scopes.
-        // Each uncorrelated IN list is built before its statement deletes.
         let brokenScopes = """
             SELECT cr.scope FROM counted_roots cr
             WHERE NOT EXISTS (
@@ -27,6 +27,15 @@ struct CountedRootIndex {
                 WHERE vm.root = cr.root AND \(CASVolumeStore.completeVolumePredicate)
             )
             """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(connection.db, "SELECT EXISTS (\(brokenScopes))", -1, &stmt, nil) == SQLITE_OK,
+              let stmt, sqlite3_step(stmt) == SQLITE_ROW else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+        }
+        guard sqlite3_column_int64(stmt, 0) != 0 else { return }
+        // Markers first: the second statement still finds the same scopes.
+        // Each uncorrelated IN list is built before its statement deletes.
         try connection.transaction {
             try connection.exec("DELETE FROM counted_markers WHERE scope IN (\(brokenScopes))")
             try connection.exec("DELETE FROM counted_roots WHERE scope IN (\(brokenScopes))")
@@ -57,7 +66,8 @@ struct CountedRootIndex {
                 for (root, delta) in changes {
                     let current = try storedCount(scope: scope, root: root)
                     let (count, overflow) = current.addingReportingOverflow(delta)
-                    guard !overflow, count >= 0 else { throw BrokerError.negativeCount(root) }
+                    guard !overflow else { throw BrokerError.countedRootOverflow(root) }
+                    guard count >= 0 else { throw BrokerError.negativeCount(root) }
                     if current == 0, count > 0,
                        try !CASVolumeStore.isCompleteVolume(root: root, db: connection.db) {
                         missing.append(root)
@@ -116,38 +126,47 @@ struct CountedRootIndex {
         }
     }
 
-    func countedRoots(scope: String) async throws -> [String: Int] {
-        guard !scope.isEmpty, !scope.utf8.contains(0) else { return [:] }
+    /// One statement, so one snapshot: the marker and the counts it was
+    /// written with.
+    func countedState(scope: String) async throws -> (marker: String?, counts: [String: Int]) {
+        guard !scope.isEmpty, !scope.utf8.contains(0) else { return (nil, [:]) }
         return try await connection.read {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             let db = connection.readDb
-            guard sqlite3_prepare_v2(db, "SELECT root, count FROM counted_roots WHERE scope=?1", -1, &stmt, nil) == SQLITE_OK,
+            let sql = """
+                SELECT NULL, marker FROM counted_markers WHERE scope=?1
+                UNION ALL
+                SELECT count, root FROM counted_roots WHERE scope=?1
+                """
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
                   let stmt,
                   sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
                 throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
             }
-            var result: [String: Int] = [:]
+            var marker: String?
+            var counts: [String: Int] = [:]
             while true {
                 switch sqlite3_step(stmt) {
                 case SQLITE_ROW:
-                    guard let ptr = sqlite3_column_text(stmt, 0) else {
+                    guard sqlite3_column_type(stmt, 1) == SQLITE_TEXT,
+                          let ptr = sqlite3_column_text(stmt, 1) else {
                         throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
                     }
-                    result[String(cString: ptr)] = Int(sqlite3_column_int64(stmt, 1))
+                    switch sqlite3_column_type(stmt, 0) {
+                    case SQLITE_NULL:
+                        marker = String(cString: ptr)
+                    case SQLITE_INTEGER:
+                        counts[String(cString: ptr)] = Int(sqlite3_column_int64(stmt, 0))
+                    default:
+                        throw BrokerError.sqlFailed("read counted root")
+                    }
                 case SQLITE_DONE:
-                    return result
+                    return (marker, counts)
                 default:
                     throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
                 }
             }
-        }
-    }
-
-    func countedMarker(scope: String) async throws -> String? {
-        guard !scope.isEmpty, !scope.utf8.contains(0) else { return nil }
-        return try await connection.read {
-            try textColumn(db: connection.readDb, "SELECT marker FROM counted_markers WHERE scope=?1", scope).first
         }
     }
 
@@ -224,8 +243,11 @@ struct CountedRootIndex {
     /// A marker is named as a scope is: SQLite reads a bound string up to its
     /// first NUL, so such a marker would stand for another.
     static func validateMarker(_ marker: String) throws {
-        guard !marker.isEmpty, !marker.utf8.contains(0) else {
-            throw BrokerError.invalidRetainedRoots("marker must not be empty or contain NUL")
+        guard !marker.isEmpty else {
+            throw BrokerError.invalidCountedMarker("marker must not be empty")
+        }
+        guard !marker.utf8.contains(0) else {
+            throw BrokerError.invalidCountedMarker("marker must not contain NUL")
         }
     }
 }

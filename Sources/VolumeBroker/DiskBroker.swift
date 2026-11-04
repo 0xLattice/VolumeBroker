@@ -99,12 +99,8 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
             scope: scope, deltas: deltas, marker: marker, expectedMarker: expectedMarker)
     }
 
-    public func countedRoots(scope: String) async throws -> [String: Int] {
-        try await countedRoots.countedRoots(scope: scope)
-    }
-
-    public func countedMarker(scope: String) async throws -> String? {
-        try await countedRoots.countedMarker(scope: scope)
+    public func countedState(scope: String) async throws -> (marker: String?, counts: [String: Int]) {
+        try await countedRoots.countedState(scope: scope)
     }
 
     public func countedScopes(prefix: String) async throws -> [String] {
