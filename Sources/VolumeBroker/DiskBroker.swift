@@ -7,17 +7,19 @@ import Foundation
 ///   - `SQLiteConnection`  — connection/PRAGMA/schema + serialised read/write access.
 ///   - `CASVolumeStore`    — content-addressed volume store (store/fetch/has).
 ///   - `RetainedRootIndex` — named retained-root sets, release, and sweep.
+///   - `CountedRootIndex`  — counted roots and their markers.
 ///
 /// Durability: the write connection runs WAL with `synchronous=FULL`, so every
 /// committed transaction is fsynced to the WAL before `COMMIT` returns. A
 /// `store` that returns has survived any later crash; no separate sync exists.
-public final class DiskBroker: @unchecked Sendable, RetainedRootReleaseBroker {
+public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
     public let near: (any VolumeBroker)?
     public let far: (any VolumeBroker)?
 
     private let connection: SQLiteConnection
     private let volumes: CASVolumeStore
     private let retainedRoots: RetainedRootIndex
+    private let countedRoots: CountedRootIndex
 
     public init(
         path: String,
@@ -27,7 +29,10 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootReleaseBroker {
         let connection = try SQLiteConnection(path: path)
         self.connection = connection
         self.volumes = CASVolumeStore(connection: connection)
-        self.retainedRoots = RetainedRootIndex(connection: connection)
+        let retainedRoots = RetainedRootIndex(connection: connection)
+        self.retainedRoots = retainedRoots
+        self.countedRoots = CountedRootIndex(connection: connection, retained: retainedRoots)
+        try countedRoots.dropScopesCountingMissingRoots()
         self.near = near
         self.far = far
     }
@@ -80,6 +85,30 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootReleaseBroker {
 
     public func retainedScopes(prefix: String) async throws -> [String] {
         try await retainedRoots.retainedScopes(prefix: prefix)
+    }
+
+    // MARK: - Counted Roots
+
+    public func adjustCountedRoots(
+        scope: String,
+        deltas: [String: Int],
+        marker: String,
+        expectedMarker: String?
+    ) async throws {
+        try await countedRoots.adjustCountedRoots(
+            scope: scope, deltas: deltas, marker: marker, expectedMarker: expectedMarker)
+    }
+
+    public func countedState(scope: String) async throws -> (marker: String?, counts: [String: Int]) {
+        try await countedRoots.countedState(scope: scope)
+    }
+
+    public func countedScopes(prefix: String) async throws -> [String] {
+        try await countedRoots.countedScopes(prefix: prefix)
+    }
+
+    public func dropCountedScope(scope: String) async throws {
+        try await countedRoots.dropCountedScope(scope: scope)
     }
 
     public func checkpoint() async {

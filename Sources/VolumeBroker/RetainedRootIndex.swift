@@ -11,7 +11,8 @@ import VolumeBrokerSQLite
 struct RetainedRootIndex {
     let connection: SQLiteConnection
 
-    /// Delete every Volume no scope retains (its membership cascades), then every
+    /// Delete every Volume no scope retains and no scope counts (its
+    /// membership cascades), then every
     /// CAS row no surviving Volume owns, in one transaction on the serial
     /// write connection. Advances and stores serialize against it there, so a
     /// root an advance commits first is kept by the sweep, and an advance
@@ -22,6 +23,7 @@ struct RetainedRootIndex {
                 try connection.exec("""
                     DELETE FROM volume_metadata
                     WHERE root NOT IN (SELECT root FROM retained_roots)
+                      AND root NOT IN (SELECT root FROM counted_roots)
                     """)
                 let removed = Int(sqlite3_changes(connection.db))
                 try connection.exec("""
@@ -75,7 +77,7 @@ struct RetainedRootIndex {
         }
     }
 
-    /// `roots` leave `scope`; each of them no scope then retains is deleted
+    /// `roots` leave `scope`; each of them no scope then retains or counts is deleted
     /// (its membership cascades) with the CAS rows it leaves unowned, in one
     /// transaction on the serial write connection. The work is in the roots
     /// named, not in the size of the store.
@@ -91,29 +93,39 @@ struct RetainedRootIndex {
                         sqlite3_bind_text(stmt, 2, root, -1, SQLITE_TRANSIENT_SHIM)
                     }
                 }
-                var removed = 0
-                for root in canonicalRoots {
-                    let members = try memberCIDs(root: root)
-                    try connection.execBind("""
-                        DELETE FROM volume_metadata
-                        WHERE root=?1 AND NOT EXISTS (SELECT 1 FROM retained_roots WHERE root=?1)
-                        """) { stmt in
-                        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
-                    }
-                    guard sqlite3_changes(connection.db) > 0 else { continue }
-                    removed += 1
-                    for cid in members {
-                        try connection.execBind("""
-                            DELETE FROM cas_data
-                            WHERE cid=?1 AND NOT EXISTS (SELECT 1 FROM volume_entries WHERE cid=?1)
-                            """) { stmt in
-                            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
-                        }
-                    }
-                }
-                return removed
+                return try reclaim(roots: canonicalRoots)
             }
         }
+    }
+
+    /// Delete each of `roots` that no scope retains and no scope counts (its
+    /// membership cascades), with the CAS rows that leaves unowned. On the
+    /// write connection, inside the caller's transaction. Returns the number
+    /// of Volumes removed.
+    func reclaim(roots: [String]) throws -> Int {
+        var removed = 0
+        for root in roots {
+            let members = try memberCIDs(root: root)
+            try connection.execBind("""
+                DELETE FROM volume_metadata
+                WHERE root=?1
+                  AND NOT EXISTS (SELECT 1 FROM retained_roots WHERE root=?1)
+                  AND NOT EXISTS (SELECT 1 FROM counted_roots WHERE root=?1)
+                """) { stmt in
+                sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+            }
+            guard sqlite3_changes(connection.db) > 0 else { continue }
+            removed += 1
+            for cid in members {
+                try connection.execBind("""
+                    DELETE FROM cas_data
+                    WHERE cid=?1 AND NOT EXISTS (SELECT 1 FROM volume_entries WHERE cid=?1)
+                    """) { stmt in
+                    sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+                }
+            }
+        }
+        return removed
     }
 
     /// On the write connection, inside the caller's transaction.
@@ -216,7 +228,7 @@ struct RetainedRootIndex {
         }
     }
 
-    private static func validateScope(_ scope: String) throws {
+    static func validateScope(_ scope: String) throws {
         guard !scope.isEmpty else {
             throw BrokerError.invalidRetainedRoots("scope must not be empty")
         }
@@ -228,7 +240,7 @@ struct RetainedRootIndex {
         }
     }
 
-    private static func canonicalRoots(_ roots: [String]) throws -> [String] {
+    static func canonicalRoots(_ roots: [String]) throws -> [String] {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
             throw BrokerError.invalidRetainedRoots("roots must not contain empty strings")
