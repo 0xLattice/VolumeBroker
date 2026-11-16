@@ -15,7 +15,7 @@ Retention never substitutes for publication.
 | VOLUME-008 | Loose CAS rows and incomplete membership grant no visibility; requested bytes are returned only after CID validation. |
 | VOLUME-009 | Retained-root sets accept only complete local roots, all-or-none. A Volume is kept if a scope retains or counts its root, and only then: retaining or counting a root does not keep a Volume nested under it. `MemoryBroker` sweeps by the same rule. |
 | VOLUME-010 | Retained-set replacement and merge are naturally idempotent. Advance replaces the whole set, so a caller that both merges and advances one scope serializes them. |
-| VOLUME-011 | `sweep` removes every Volume no scope retains or counts and then every unowned CAS row in one transaction, serialized with stores and advances; it has no grace window. |
+| VOLUME-011 | `sweep` removes every Volume no scope retains or counts and then every unowned CAS row in one transaction, serialized with stores and advances; it has no grace window. Every commit leaves each CAS row owned, so those rows are the ones the removed Volumes leave unowned, and the sweep reaches them through those Volumes, not a scan of the store. |
 | VOLUME-012 | Shared CAS bytes remain until their last owning Volume is removed. |
 | VOLUME-013 | Immutable `near` and `far` links are read tiers in one domain; writes and cross-domain synchronization are explicit. |
 | VOLUME-014 | Empty v0 initializes atomically; malformed, nonempty, and unsupported schemas are not mutated. |

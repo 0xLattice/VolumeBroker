@@ -20,8 +20,9 @@ struct SweepTests {
         let retained: RetainedRootIndex
     }
 
-    private func harness() throws -> Harness {
-        let path = NSTemporaryDirectory() + "vb_sweep_\(UUID().uuidString).sqlite"
+    private func harness(
+        path: String = NSTemporaryDirectory() + "vb_sweep_\(UUID().uuidString).sqlite"
+    ) throws -> Harness {
         let connection = try SQLiteConnection(path: path)
         return Harness(
             connection: connection,
@@ -150,6 +151,61 @@ struct SweepTests {
         #expect(await h.store.fetchVolumeLocal(root: top.root)?.entries == top.entries)
     }
 
+    /// The sweep removes exactly what the scan over every CAS row did: each
+    /// unheld Volume and the bytes it leaves unowned, nothing a retained or
+    /// counted Volume still owns. It reaches them through the Volumes it
+    /// removes, never a scan of `cas_data` or `volume_entries`.
+    @Test func sweepRemovesTheBytesUnheldVolumesLeaveUnownedByIndex() async throws {
+        let h = try harness()
+        let counted = CountedRootIndex(connection: h.connection, retained: h.retained)
+        let shared = Data("shared".utf8)
+        let dropShared = Data("drop-shared".utf8)
+        try await h.store.storeVolumesLocal([
+            volume("kept", ["shared": shared, "kept-own": Data("kept-own".utf8)]),
+            volume("counted", ["shared": shared, "counted-own": Data("counted-own".utf8)]),
+            volume("drop1", ["shared": shared, "drop1-own": Data("drop1-own".utf8), "drop-shared": dropShared]),
+            volume("drop2", ["drop2-own": Data("drop2-own".utf8), "drop-shared": dropShared]),
+        ])
+        try await h.retained.advanceRetainedRoots(scope: "s", roots: [cid("kept")])
+        try await counted.adjustCountedRoots(
+            scope: "c", deltas: [cid("counted"): 1], marker: "m", expectedMarker: nil)
+
+        let (removed, plan) = try await sweepTracingPlans(h)
+
+        #expect(removed == 2)
+        for gone in ["drop1", "drop2", "drop1-own", "drop2-own", "drop-shared"] {
+            #expect(await casRowCount(connection: h.connection, cid: cid(gone)) == 0, "\(gone)")
+        }
+        for kept in ["kept", "counted", "shared", "kept-own", "counted-own"] {
+            #expect(await casRowCount(connection: h.connection, cid: cid(kept)) == 1, "\(kept)")
+        }
+        #expect(await count(h.connection, """
+            SELECT COUNT(*) FROM cas_data WHERE NOT EXISTS (
+                SELECT 1 FROM volume_entries ve WHERE ve.cid = cas_data.cid)
+            """) == 0)
+        #expect(await count(h.connection, "SELECT COUNT(*) FROM cas_data") == 5)
+        #expect(plan.contains { $0.hasPrefix("SEARCH cas_data") })
+        #expect(!plan.contains { $0.hasPrefix("SCAN cas_data") || $0.hasPrefix("SCAN volume_entries") }, "\(plan)")
+    }
+
+    /// Reopening a store with nothing to collect and sweeping it reads no
+    /// CAS row and no membership row.
+    @Test func cleanReopenSweepScansNoContent() async throws {
+        let path = NSTemporaryDirectory() + "vb_sweep_\(UUID().uuidString).sqlite"
+        do {
+            let h = try harness(path: path)
+            try await h.store.storeVolumesLocal([volume("a", ["leaf": Data("leaf".utf8)]), volume("b")])
+            try await h.retained.advanceRetainedRoots(scope: "s", roots: [cid("a"), cid("b")])
+        }
+
+        let h = try harness(path: path)
+        let (removed, plan) = try await sweepTracingPlans(h)
+
+        #expect(removed == 0)
+        #expect(await count(h.connection, "SELECT COUNT(*) FROM cas_data") == 3)
+        #expect(!plan.contains { $0.contains("cas_data") || $0.contains("volume_entries") }, "\(plan)")
+    }
+
     @Test func retainedRootReadPropagatesSQLFailure() async throws {
         let h = try harness()
         #expect(sqlite3_set_authorizer(h.connection.readDb, { _, action, _, _, _, _ in
@@ -226,6 +282,50 @@ struct SweepTests {
         #expect(await h.store.hasVolume(root: cid("first")))
         #expect(await h.store.hasVolume(root: cid("second")))
         #expect(await casRowCount(connection: h.connection, cid: cid(for: leaf)) == 1)
+    }
+
+    private final class TracedSQL: @unchecked Sendable { var statements: [String] = [] }
+
+    /// Sweep with every statement the write connection prepares traced, and
+    /// return the query plan details of those statements.
+    private func sweepTracingPlans(_ h: Harness) async throws -> (Int, [String]) {
+        let traced = TracedSQL()
+        sqlite3_trace_v2(h.connection.db, UInt32(SQLITE_TRACE_STMT), { _, context, statement, _ in
+            let traced = Unmanaged<TracedSQL>.fromOpaque(context!).takeUnretainedValue()
+            if let statement, let sql = sqlite3_sql(OpaquePointer(statement)) {
+                traced.statements.append(String(cString: sql))
+            }
+            return 0
+        }, Unmanaged.passUnretained(traced).toOpaque())
+        defer { sqlite3_trace_v2(h.connection.db, 0, nil, nil) }
+        let removed = try await h.retained.sweep()
+
+        let statements = traced.statements
+        let plan = await h.connection.read {
+            statements.flatMap { sql -> [String] in
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                guard sqlite3_prepare_v2(h.connection.readDb, "EXPLAIN QUERY PLAN " + sql, -1, &stmt, nil) == SQLITE_OK,
+                      let stmt else { return ["unexplained: \(sql)"] }
+                var details: [String] = []
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    details.append(String(cString: sqlite3_column_text(stmt, 3)))
+                }
+                return details
+            }
+        }
+        #expect(statements.contains { $0.contains("FROM volume_metadata") })
+        return (removed, plan)
+    }
+
+    private func count(_ connection: SQLiteConnection, _ sql: String) async -> Int {
+        await connection.read {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK, let stmt,
+                  sqlite3_step(stmt) == SQLITE_ROW else { return -1 }
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
     }
 
     private func casRowCount(connection: SQLiteConnection, cid: String) async -> Int {

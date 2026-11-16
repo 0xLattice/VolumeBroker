@@ -340,8 +340,7 @@ final class SQLiteConnection: @unchecked Sendable {
               AND child.name NOT IN (\(protectedTables))
               AND fk."table" COLLATE NOCASE IN (\(protectedTables))
             """
-        ) == 0,
-        try scalarInt(db: db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0 else {
+        ) == 0 else {
             throw BrokerError.invalidSchema(version: schemaVersion)
         }
     }

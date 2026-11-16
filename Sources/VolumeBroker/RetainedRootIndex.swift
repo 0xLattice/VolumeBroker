@@ -12,27 +12,21 @@ struct RetainedRootIndex {
     let connection: SQLiteConnection
 
     /// Delete every Volume no scope retains and no scope counts (its
-    /// membership cascades), then every
-    /// CAS row no surviving Volume owns, in one transaction on the serial
-    /// write connection. Advances and stores serialize against it there, so a
-    /// root an advance commits first is kept by the sweep, and an advance
-    /// that runs after it sees exactly what survived.
+    /// membership cascades), with the CAS rows that leaves unowned, in one
+    /// transaction on the serial write connection. Every commit leaves each
+    /// CAS row owned, so those are all the unowned rows, and the work is in
+    /// the Volumes removed, not in the size of the store. Advances and stores
+    /// serialize against it there, so a root an advance commits first is
+    /// kept by the sweep, and an advance that runs after it sees exactly what
+    /// survived.
     func sweep() async throws -> Int {
         try await connection.write {
             try connection.transaction {
-                try connection.exec("""
-                    DELETE FROM volume_metadata
+                try reclaim(roots: textColumn("""
+                    SELECT root FROM volume_metadata
                     WHERE root NOT IN (SELECT root FROM retained_roots)
                       AND root NOT IN (SELECT root FROM counted_roots)
-                    """)
-                let removed = Int(sqlite3_changes(connection.db))
-                try connection.exec("""
-                    DELETE FROM cas_data
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM volume_entries ve WHERE ve.cid = cas_data.cid
-                    )
-                    """)
-                return removed
+                    """))
             }
         }
     }
@@ -105,7 +99,7 @@ struct RetainedRootIndex {
     func reclaim(roots: [String]) throws -> Int {
         var removed = 0
         for root in roots {
-            let members = try memberCIDs(root: root)
+            let members = try textColumn("SELECT cid FROM volume_entries WHERE root=?1", root)
             try connection.execBind("""
                 DELETE FROM volume_metadata
                 WHERE root=?1
@@ -129,12 +123,14 @@ struct RetainedRootIndex {
     }
 
     /// On the write connection, inside the caller's transaction.
-    private func memberCIDs(root: String) throws -> [String] {
+    private func textColumn(_ sql: String, _ values: String...) throws -> [String] {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(connection.db, "SELECT cid FROM volume_entries WHERE root=?1", -1, &stmt, nil) == SQLITE_OK,
+        guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK,
               let stmt,
-              sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
+              values.indices.allSatisfy({
+                  sqlite3_bind_text(stmt, Int32($0 + 1), values[$0], -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK
+              }) else {
             throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
         }
         var result: [String] = []
