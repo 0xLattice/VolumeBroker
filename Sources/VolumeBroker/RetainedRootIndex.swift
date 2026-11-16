@@ -15,7 +15,8 @@ struct RetainedRootIndex {
     /// membership cascades), with the CAS rows that leaves unowned, in one
     /// transaction on the serial write connection. Every commit leaves each
     /// CAS row owned, so those are all the unowned rows, and the work is in
-    /// the Volumes removed, not in the size of the store. Advances and stores
+    /// the Volumes removed and one pass over the Volume list, not in the size of the
+    /// content. Advances and stores
     /// serialize against it there, so a root an advance commits first is
     /// kept by the sweep, and an advance that runs after it sees exactly what
     /// survived.

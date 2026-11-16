@@ -37,7 +37,8 @@ public protocol RetainedRootBroker: VolumeBroker {
     /// older snapshot drops every root merged after that snapshot.
     func advanceRetainedRoots(scope: String, roots: [String]) async throws
     func retainedRoots(scope: String) async throws -> [String]
-    /// Remove every unretained Volume and unowned CAS row in one atomic step.
+    /// Remove every unretained Volume and the CAS rows it leaves unowned, in one
+    /// atomic step.
     /// Returns the number of Volumes removed.
     @discardableResult
     func sweep() async throws -> Int
