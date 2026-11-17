@@ -54,10 +54,9 @@ struct Benchmarks {
     }
 
     private func processCPUMilliseconds() -> Double {
-        var usage = rusage()
-        getrusage(RUSAGE_SELF, &usage)
-        func ms(_ t: timeval) -> Double { Double(t.tv_sec) * 1000 + Double(t.tv_usec) / 1000 }
-        return ms(usage.ru_utime) + ms(usage.ru_stime)
+        var now = timespec()
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now)
+        return Double(now.tv_sec) * 1000 + Double(now.tv_nsec) / 1_000_000
     }
 
     /// Wall time, and the process's CPU time, per operation: on a shared
