@@ -495,11 +495,6 @@ struct DiskBrokerTests {
         }
     }
 
-    /// Regression: DiskBroker is shared across multiple ChainNetwork actors.
-    /// Without serialising complete write transactions, two actors calling
-    /// store(volume:) calls can concurrently pass SQLITE_OPEN_FULLMUTEX's
-    /// per-call serialisation and then both issue BEGIN IMMEDIATE, causing the
-    /// second to fail with "cannot start a transaction within a transaction".
     /// A read that starts while another read is still stepping sees every
     /// commit that returned before it started, not the other read's
     /// snapshot.
@@ -542,6 +537,11 @@ struct DiskBrokerTests {
         #expect(try await overlapping.value == [volume.root])
     }
 
+    /// Regression: DiskBroker is shared across multiple ChainNetwork actors.
+    /// Without serialising complete write transactions, two actors calling
+    /// store(volume:) calls can concurrently pass SQLITE_OPEN_FULLMUTEX's
+    /// per-call serialisation and then both issue BEGIN IMMEDIATE, causing the
+    /// second to fail with "cannot start a transaction within a transaction".
     @Test("Concurrent writes from multiple actors do not produce nested-transaction errors")
     func testConcurrentWritesFromMultipleActors() async throws {
         let broker = try tempDB()
