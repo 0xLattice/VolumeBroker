@@ -56,17 +56,30 @@ struct RetainedRootIndex {
     }
 
     func mergeRetainedRoots(scope: String, roots: [String]) async throws {
-        let canonicalRoots = try Self.canonicalRoots(roots)
-        try Self.validateScope(scope)
-
+        let merges = try Self.canonicalMerges([scope: roots])
         try await connection.write {
-            try connection.transaction {
-                for root in canonicalRoots {
-                    try validateStoredVolume(root: root)
-                    try connection.execBind("INSERT OR IGNORE INTO retained_roots(scope, root) VALUES(?1, ?2)") { stmt in
-                        sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
-                        sqlite3_bind_text(stmt, 2, root, -1, SQLITE_TRANSIENT_SHIM)
-                    }
+            try connection.transaction { try merge(merges) }
+        }
+    }
+
+    /// Each scope with its roots, checked and in order, for `merge`.
+    static func canonicalMerges(_ merges: [String: [String]]) throws -> [(scope: String, roots: [String])] {
+        try merges.keys.sorted().map { scope in
+            let roots = try canonicalRoots(merges[scope] ?? [])
+            try validateScope(scope)
+            return (scope, roots)
+        }
+    }
+
+    /// Adds each scope's roots to it, every root a complete stored Volume.
+    /// On the write connection, inside the caller's transaction.
+    func merge(_ merges: [(scope: String, roots: [String])]) throws {
+        for (scope, roots) in merges {
+            for root in roots {
+                try validateStoredVolume(root: root)
+                try connection.execBind("INSERT OR IGNORE INTO retained_roots(scope, root) VALUES(?1, ?2)") { stmt in
+                    sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
+                    sqlite3_bind_text(stmt, 2, root, -1, SQLITE_TRANSIENT_SHIM)
                 }
             }
         }
@@ -89,6 +102,29 @@ struct RetainedRootIndex {
                     }
                 }
                 return try reclaim(roots: canonicalRoots)
+            }
+        }
+    }
+
+    /// Every root of each of `scopes` leaves it; each of those no scope then
+    /// retains or counts is deleted with the CAS rows it leaves unowned, in
+    /// one transaction on the serial write connection. The work is in the
+    /// roots the scopes retain.
+    func releaseRetainedScopes(_ scopes: [String]) async throws -> Int {
+        let scopes = Array(Set(scopes)).sorted()
+        for scope in scopes { try Self.validateScope(scope) }
+        guard !scopes.isEmpty else { return 0 }
+
+        return try await connection.write {
+            try connection.transaction {
+                var released = Set<String>()
+                for scope in scopes {
+                    released.formUnion(try textColumn("SELECT root FROM retained_roots WHERE scope=?1", scope))
+                    try connection.execBind("DELETE FROM retained_roots WHERE scope=?1") { stmt in
+                        sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
+                    }
+                }
+                return try reclaim(roots: released.sorted())
             }
         }
     }

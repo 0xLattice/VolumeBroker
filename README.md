@@ -91,7 +91,8 @@ named, not in the size of the store, and it touches nothing else.
 
 `retainedScopes(prefix:)` lists the scopes that retain something. A caller
 that keeps one scope per thing it holds uses it to find the ones it no longer
-has a reason for.
+has a reason for, and `releaseRetainedScopes` lets go of several of them,
+everything each retains, in one transaction.
 
 - A scope's name is its bytes. A prefix is a prefix of bytes, the listing is
   in byte order, and a name with a NUL is refused.
@@ -103,7 +104,9 @@ has a reason for.
   release that names them.
 - Storing and then retaining are two commits. A release or a sweep between
   them removes what was stored, and the retain is then refused whole with
-  `missingRetainedRoot`: store again and retry.
+  `missingRetainedRoot`: store again and retry. `storeVolumesLocal(_:retaining:)`
+  makes them one: the batch is stored and each scope's roots merged in one
+  transaction, or nothing changes.
 
 ### Counted roots
 

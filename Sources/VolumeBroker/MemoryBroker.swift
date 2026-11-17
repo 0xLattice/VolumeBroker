@@ -61,11 +61,29 @@ public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
     }
 
     public func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
+        try await storeVolumesLocal(volumes, retaining: [:])
+    }
+
+    public func storeVolumesLocal(_ volumes: [SerializedVolume], retaining: [String: [String]]) async throws {
         let volumes = volumes.map { $0.ownedCopy() }
         for volume in volumes { try volume.validate() }
-        guard !volumes.isEmpty else { return }
+        let merges = try retaining.keys.sorted().map { scope in
+            let roots = try Self.canonicalRetainedRoots(retaining[scope] ?? [])
+            try Self.validateScope(scope)
+            return (scope: scope, roots: roots)
+        }
+        guard !volumes.isEmpty || !merges.isEmpty else { return }
         try lock.withWriteLock {
             let newVolumes = try Self.preflight(volumes, state: state)
+            // Every root retained is complete once the batch is in: checked
+            // before anything changes, so a refusal changes nothing.
+            let stored = Set(volumes.map(\.root))
+            for root in merges.flatMap(\.roots) where !stored.contains(root) {
+                try Self.validateRetainedVolume(root: root, state: state)
+            }
+            for (scope, roots) in merges where !roots.isEmpty {
+                state.retainedRoots[Array(scope.utf8), default: []].formUnion(roots)
+            }
             for volume in newVolumes {
                 state.membersByRoot[volume.root] = Set(volume.entries.keys)
                 for (cid, data) in volume.entries {
@@ -210,6 +228,20 @@ public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
             removeVolume(root: root, state: &state)
         }
         return dead.count
+    }
+
+    @discardableResult
+    public func releaseRetainedScopes(_ scopes: [String]) async throws -> Int {
+        let keys = Set(scopes)
+        for scope in keys { try Self.validateScope(scope) }
+
+        return lock.withWriteLock {
+            var released = Set<String>()
+            for scope in keys {
+                released.formUnion(state.retainedRoots.removeValue(forKey: Array(scope.utf8)) ?? [])
+            }
+            return Self.reclaim(roots: Array(released), state: &state)
+        }
     }
 
     public func retainedScopes(prefix: String) async throws -> [String] {
