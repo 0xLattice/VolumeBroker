@@ -620,30 +620,33 @@ struct ScopeTests {
             INSERT INTO retained_roots(scope, root) SELECT 'p:body:' || printf('%06d', i), '\(held)' FROM n
             """, write: true)
         let stop = Ledger()
+        let rounds = Ledger()
         let writer = Task {
-            var rounds = 0
             while await stop.merged.isEmpty {
                 // {first} {first,last} {last} {first,last} {first}
                 try await broker.mergeRetainedRoots(scope: "p:~last", roots: [held])
                 try await broker.releaseRetainedRoots(scope: "p:!first", roots: [held])
                 try await broker.mergeRetainedRoots(scope: "p:!first", roots: [held])
                 try await broker.releaseRetainedRoots(scope: "p:~last", roots: [held])
-                rounds += 1
+                await rounds.add("round")
             }
-            return rounds
         }
-        var torn = 0
-        for _ in 0..<40 {
+        // At least 40 listings, and on until the writer has committed 40
+        // rounds under them: how the two are scheduled is not the test.
+        var torn = 0, listings = 0
+        while true {
+            let committed = await rounds.merged.count
+            if listings >= 40 && committed >= 40 { break }
             let scopes = try await broker.retainedScopes(prefix: "p:")
             let body = scopes.filter { $0.hasPrefix("p:body:") }.count
             if body != 20_000 || !(scopes.first == "p:!first" || scopes.last == "p:~last") {
                 torn += 1
             }
+            listings += 1
         }
         await stop.add("stop")
-        let rounds = try await writer.value
-        #expect(torn == 0, "\(torn) of 40 listings were no committed state")
-        #expect(rounds >= 40, "the writer committed too rarely to tear a listing: \(rounds) rounds")
+        try await writer.value
+        #expect(torn == 0, "\(torn) of \(listings) listings were no committed state")
         #expect(await broker.hasVolume(root: held))
     }
 
