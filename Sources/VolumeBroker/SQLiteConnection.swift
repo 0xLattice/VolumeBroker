@@ -73,6 +73,8 @@ final class SQLiteConnection: @unchecked Sendable {
     }
 
     deinit {
+        // A connection with a statement left unfinalized does not close.
+        for statement in statements.values { sqlite3_finalize(statement) }
         sqlite3_close(readDb)
         sqlite3_close(db)
     }
@@ -129,29 +131,62 @@ final class SQLiteConnection: @unchecked Sendable {
         }
     }
 
-    /// Prepare, bind, and step a single write statement to completion.
-    func execBind(_ sql: String, bind: (OpaquePointer) -> Void) throws {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+    /// The write connection's prepared statements, by their SQL. Used only
+    /// where the write connection is: on the write queue, or in `init`'s
+    /// callers before the connection is shared. The SQL is a fixed string,
+    /// so the cache holds one statement per call site.
+    private var statements: [String: OpaquePointer] = [:]
+
+    /// Runs `body` with the write connection's prepared statement for
+    /// `sql`, prepared once and reused. The statement is reset and its
+    /// bindings cleared when `body` returns, so it holds no read and no
+    /// bound bytes between uses. A statement is out of the cache while in
+    /// use: a nested use of the same SQL prepares its own.
+    func withStatement<T>(_ sql: String, _ body: (OpaquePointer) throws -> T) throws -> T {
+        let stmt: OpaquePointer
+        if let cached = statements.removeValue(forKey: sql) {
+            stmt = cached
+        } else {
+            var prepared: OpaquePointer?
+            guard sqlite3_prepare_v3(db, sql, -1, UInt32(SQLITE_PREPARE_PERSISTENT), &prepared, nil) == SQLITE_OK,
+                  let prepared else {
+                sqlite3_finalize(prepared)
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            stmt = prepared
         }
-        bind(stmt)
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        defer {
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+            if statements[sql] == nil {
+                statements[sql] = stmt
+            } else {
+                sqlite3_finalize(stmt)
+            }
+        }
+        return try body(stmt)
+    }
+
+    /// Bind and step a single write statement to completion.
+    func execBind(_ sql: String, bind: (OpaquePointer) -> Void) throws {
+        try withStatement(sql) { stmt in
+            bind(stmt)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+            }
         }
     }
 
     /// Run `body` inside a BEGIN IMMEDIATE / COMMIT transaction on the write
     /// connection, rolling back on any thrown error.
     func transaction<T>(_ body: () throws -> T) throws -> T {
-        try exec("BEGIN IMMEDIATE")
+        try execBind("BEGIN IMMEDIATE") { _ in }
         do {
             let result = try body()
-            try exec("COMMIT")
+            try execBind("COMMIT") { _ in }
             return result
         } catch {
-            try? exec("ROLLBACK")
+            try? execBind("ROLLBACK") { _ in }
             throw error
         }
     }

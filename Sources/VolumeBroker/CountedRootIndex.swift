@@ -69,7 +69,7 @@ struct CountedRootIndex {
                     guard !overflow else { throw BrokerError.countedRootOverflow(root) }
                     guard count >= 0 else { throw BrokerError.negativeCount(root) }
                     if current == 0, count > 0,
-                       try !CASVolumeStore.isCompleteVolume(root: root, db: connection.db) {
+                       try !CASVolumeStore.isCompleteVolume(root: root, connection: connection) {
                         missing.append(root)
                     }
                     updated.append((root, count))
@@ -111,11 +111,11 @@ struct CountedRootIndex {
         try RetainedRootIndex.validateScope(scope)
         try await connection.write {
             try connection.transaction {
-                let roots = try textColumn(
-                    db: connection.db,
-                    "SELECT root FROM counted_roots WHERE scope=?1 ORDER BY root",
-                    scope
-                )
+                let roots = try connection.withStatement(
+                    "SELECT root FROM counted_roots WHERE scope=?1 ORDER BY root"
+                ) { stmt in
+                    try textColumn(stmt: stmt, db: connection.db, scope)
+                }
                 for sql in ["DELETE FROM counted_roots WHERE scope=?1", "DELETE FROM counted_markers WHERE scope=?1"] {
                     try connection.execBind(sql) { stmt in
                         sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
@@ -192,35 +192,40 @@ struct CountedRootIndex {
 
     /// On the write connection, inside the caller's transaction.
     private func storedMarker(scope: String) throws -> String? {
-        try textColumn(db: connection.db, "SELECT marker FROM counted_markers WHERE scope=?1", scope).first
+        try connection.withStatement("SELECT marker FROM counted_markers WHERE scope=?1") { stmt in
+            try textColumn(stmt: stmt, db: connection.db, scope)
+        }.first
     }
 
     /// On the write connection, inside the caller's transaction. Zero when
     /// the scope does not count the root.
     private func storedCount(scope: String, root: String) throws -> Int {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
         let db = connection.db
-        guard sqlite3_prepare_v2(db, "SELECT count FROM counted_roots WHERE scope=?1 AND root=?2", -1, &stmt, nil) == SQLITE_OK,
-              let stmt else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
-        sqlite3_bind_text(stmt, 2, root, -1, SQLITE_TRANSIENT_SHIM)
-        switch sqlite3_step(stmt) {
-        case SQLITE_ROW: return Int(sqlite3_column_int64(stmt, 0))
-        case SQLITE_DONE: return 0
-        default: throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        return try connection.withStatement("SELECT count FROM counted_roots WHERE scope=?1 AND root=?2") { stmt in
+            sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
+            sqlite3_bind_text(stmt, 2, root, -1, SQLITE_TRANSIENT_SHIM)
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW: return Int(sqlite3_column_int64(stmt, 0))
+            case SQLITE_DONE: return 0
+            default: throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+            }
         }
     }
 
-    /// The first column of every row `sql` yields with `?1` bound to `value`.
+    /// The first column of every row `sql` yields with `?1` bound to
+    /// `value`. On the read connection: each read prepares its own.
     private func textColumn(db: OpaquePointer, _ sql: String, _ value: String) throws -> [String] {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
-              let stmt,
-              sqlite3_bind_text(stmt, 1, value, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        return try textColumn(stmt: stmt, db: db, value)
+    }
+
+    /// The first column of every row `stmt` yields with `?1` bound to `value`.
+    private func textColumn(stmt: OpaquePointer, db: OpaquePointer, _ value: String) throws -> [String] {
+        guard sqlite3_bind_text(stmt, 1, value, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
             throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
         }
         var result: [String] = []

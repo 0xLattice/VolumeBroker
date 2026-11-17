@@ -931,6 +931,34 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
+    /// Swift calls "aK" and "a\u{212A}" (Kelvin sign) equal, SQLite does
+    /// not: a trusted re-store under the second spelling would add a member
+    /// row the Volume does not declare. The store refuses it, and the
+    /// stored Volume stays complete.
+    func testATrustedReStoreUnderAnEquivalentSpellingChangesNothing() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let broker = try DiskBroker(path: path)
+        let bytes = Data("root".utf8)
+        let root = try cid(for: bytes)
+        let ascii = "aK", kelvin = "a\u{212A}"
+        XCTAssertEqual(ascii, kelvin)
+        XCTAssertNotEqual(Array(ascii.utf8), Array(kelvin.utf8))
+
+        try await broker.storeVolumesLocal([try ValidatedVolume(trusting: SerializedVolume(
+            root: root, entries: [root: bytes, ascii: Data("leaf".utf8)]))])
+        do {
+            try await broker.storeVolumesLocal([try ValidatedVolume(trusting: SerializedVolume(
+                root: root, entries: [root: bytes, kelvin: Data("leaf".utf8)]))])
+            XCTFail("a member spelled another way was added to a stored Volume")
+        } catch {
+            XCTAssertEqual(error as? BrokerError, .conflictingVolume(root))
+        }
+        let complete = await broker.hasVolume(root: root)
+        XCTAssertTrue(complete)
+    }
+
     /// Damaged stored bytes are repaired by a validated Volume too: bytes
     /// that differ from stored ones are hashed, stored and validated alike.
     func testAValidatedVolumeRepairsDamagedStoredBytes() async throws {

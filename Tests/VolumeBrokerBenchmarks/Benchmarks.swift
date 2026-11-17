@@ -53,6 +53,26 @@ struct Benchmarks {
         print("  [\(label)] \(iterations) iterations in \(String(format: "%.2f", ms))ms (\(String(format: "%.3f", perOp))ms/op)")
     }
 
+    private func processCPUMilliseconds() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        func ms(_ t: timeval) -> Double { Double(t.tv_sec) * 1000 + Double(t.tv_usec) / 1000 }
+        return ms(usage.ru_utime) + ms(usage.ru_stime)
+    }
+
+    /// Wall time, and the process's CPU time, per operation: on a shared
+    /// machine the CPU time is the steadier of the two.
+    private func measureCPU(_ label: String, iterations: Int, _ body: () async throws -> Void) async throws {
+        let clock = ContinuousClock()
+        let cpuStart = processCPUMilliseconds()
+        let elapsed = try await clock.measure {
+            for _ in 0..<iterations { try await body() }
+        }
+        let cpu = processCPUMilliseconds() - cpuStart
+        let ms = Double(elapsed.components.attoseconds) / 1e15 + Double(elapsed.components.seconds) * 1000
+        print("  [\(label)] \(iterations) iterations: wall \(String(format: "%.3f", ms / Double(iterations)))ms/op, cpu \(String(format: "%.3f", cpu / Double(iterations)))ms/op")
+    }
+
     // MARK: - DiskBroker Store
 
     @Test func diskStoreSmallVolumes() async throws {
@@ -104,6 +124,46 @@ struct Benchmarks {
         }
         try await measure("batch store", iterations: 1) {
             try await brokerBatch.storeVolumesLocal(batchPayloads)
+        }
+    }
+
+    /// The write path a node drives per block: a batch of Volumes stored
+    /// and retained in one transaction, a retain of stored roots, and a
+    /// counted-root adjust. Payloads are built before timing, and taken on
+    /// trust, so the time is the broker's.
+    @Test func diskWritePathPerOperation() async throws {
+        let broker = try tempDB()
+        let batches = 200
+        let perBatch = 8
+        let volumes = (0..<batches).map { b in
+            (0..<perBatch).map { v in
+                try! ValidatedVolume(trusting: payload("wp-\(b)-\(v)", entryCount: 16, dataSize: 128))
+            }
+        }
+        print("\n--- DiskBroker: write path per operation ---")
+        var batch = 0
+        try await measureCPU("store+retain batch (\(perBatch) Volumes x 16 entries)", iterations: batches) {
+            let roots = volumes[batch].map(\.volume.root)
+            try await broker.storeVolumesLocal(volumes[batch], retaining: ["blocks": roots])
+            batch += 1
+        }
+        let roots = volumes.flatMap { $0.map(\.volume.root) }
+        var next = 0
+        try await measureCPU("retain 1 stored root", iterations: 1_000) {
+            try await broker.mergeRetainedRoots(scope: "tips", roots: [roots[next % roots.count]])
+            next += 1
+        }
+        var marker: String?
+        var step = 0
+        try await measureCPU("adjust 8 roots (0<->1)", iterations: 1_000) {
+            let delta = step % 2 == 0 ? 1 : -1
+            let window = (0..<8).map { roots[(step / 2 * 8 + $0) % roots.count] }
+            let deltas = Dictionary(uniqueKeysWithValues: window.map { ($0, delta) })
+            let newMarker = "m\(step)"
+            try await broker.adjustCountedRoots(
+                scope: "state", deltas: deltas, marker: newMarker, expectedMarker: marker)
+            marker = newMarker
+            step += 1
         }
     }
 

@@ -32,20 +32,33 @@ struct CASVolumeStore: VolumeStorer {
         }
     }
 
+    private static let isCompleteVolumeSQL = """
+        SELECT 1
+        FROM volume_metadata vm
+        WHERE vm.root = ?1
+          AND \(completeVolumePredicate)
+        LIMIT 1
+        """
+
+    /// On the read connection: reads run concurrently, so each prepares its own.
     static func isCompleteVolume(root: String, db: OpaquePointer) throws -> Bool {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        let sql = """
-            SELECT 1
-            FROM volume_metadata vm
-            WHERE vm.root = ?1
-              AND \(completeVolumePredicate)
-            LIMIT 1
-            """
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+        guard sqlite3_prepare_v2(db, isCompleteVolumeSQL, -1, &stmt, nil) == SQLITE_OK,
               let stmt else {
             throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
         }
+        return try isCompleteVolume(root: root, stmt: stmt, db: db)
+    }
+
+    /// On the write connection, inside the caller's transaction.
+    static func isCompleteVolume(root: String, connection: SQLiteConnection) throws -> Bool {
+        try connection.withStatement(isCompleteVolumeSQL) { stmt in
+            try isCompleteVolume(root: root, stmt: stmt, db: connection.db)
+        }
+    }
+
+    private static func isCompleteVolume(root: String, stmt: OpaquePointer, db: OpaquePointer) throws -> Bool {
         sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
         let result = sqlite3_step(stmt)
         if result == SQLITE_ROW { return true }
@@ -251,53 +264,38 @@ struct CASVolumeStore: VolumeStorer {
     // MARK: - Transaction helpers
 
     private func validateExistingMembership(of volume: SerializedVolume) throws {
-        var metadataStmt: OpaquePointer?
-        defer { sqlite3_finalize(metadataStmt) }
-        guard sqlite3_prepare_v2(
-            connection.db,
-            "SELECT entry_count FROM volume_metadata WHERE root = ?1",
-            -1,
-            &metadataStmt,
-            nil
-        ) == SQLITE_OK, let metadataStmt else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        sqlite3_bind_text(metadataStmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
-
-        let metadataResult = sqlite3_step(metadataStmt)
-        let existingEntryCount: Int?
-        if metadataResult == SQLITE_ROW {
-            guard sqlite3_column_type(metadataStmt, 0) == SQLITE_INTEGER else {
-                throw BrokerError.conflictingVolume(volume.root)
+        let db = connection.db
+        let existingEntryCount: Int? = try connection.withStatement(
+            "SELECT entry_count FROM volume_metadata WHERE root = ?1"
+        ) { metadataStmt in
+            sqlite3_bind_text(metadataStmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
+            let metadataResult = sqlite3_step(metadataStmt)
+            if metadataResult == SQLITE_ROW {
+                guard sqlite3_column_type(metadataStmt, 0) == SQLITE_INTEGER else {
+                    throw BrokerError.conflictingVolume(volume.root)
+                }
+                return Int(sqlite3_column_int64(metadataStmt, 0))
+            } else if metadataResult == SQLITE_DONE {
+                return nil
+            } else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
             }
-            existingEntryCount = Int(sqlite3_column_int64(metadataStmt, 0))
-        } else if metadataResult == SQLITE_DONE {
-            existingEntryCount = nil
-        } else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
         }
 
-        var membersStmt: OpaquePointer?
-        defer { sqlite3_finalize(membersStmt) }
-        guard sqlite3_prepare_v2(
-            connection.db,
-            "SELECT cid FROM volume_entries WHERE root = ?1",
-            -1,
-            &membersStmt,
-            nil
-        ) == SQLITE_OK, let membersStmt else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        sqlite3_bind_text(membersStmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
-
-        var existingMembers = Set<String>()
-        while true {
-            let result = sqlite3_step(membersStmt)
-            if result == SQLITE_DONE { break }
-            guard result == SQLITE_ROW, let cid = sqlite3_column_text(membersStmt, 0) else {
-                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+        let existingMembers: Set<String> = try connection.withStatement(
+            "SELECT cid FROM volume_entries WHERE root = ?1"
+        ) { membersStmt in
+            sqlite3_bind_text(membersStmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
+            var existingMembers = Set<String>()
+            while true {
+                let result = sqlite3_step(membersStmt)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW, let cid = sqlite3_column_text(membersStmt, 0) else {
+                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+                }
+                existingMembers.insert(String(cString: cid))
             }
-            existingMembers.insert(String(cString: cid))
+            return existingMembers
         }
 
         let expectedMembers = Set(volume.entries.keys)
@@ -312,38 +310,30 @@ struct CASVolumeStore: VolumeStorer {
     }
 
     private func validateExistingContent(cid: String, data: Data) throws {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(
-            connection.db,
-            "SELECT data FROM cas_data WHERE cid = ?1",
-            -1,
-            &stmt,
-            nil
-        ) == SQLITE_OK, let stmt else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+        let db = connection.db
+        // Nil when no row holds `cid`.
+        let existing: Data? = try connection.withStatement("SELECT data FROM cas_data WHERE cid = ?1") { stmt in
+            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
 
-        let result = sqlite3_step(stmt)
-        if result == SQLITE_DONE { return }
-        guard result == SQLITE_ROW else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
-            throw BrokerError.sqlFailed("read existing content")
-        }
+            let result = sqlite3_step(stmt)
+            if result == SQLITE_DONE { return nil }
+            guard result == SQLITE_ROW else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
+                throw BrokerError.sqlFailed("read existing content")
+            }
 
-        let length = Int(sqlite3_column_bytes(stmt, 0))
-        let existing: Data
-        if length == 0 {
-            existing = Data()
-        } else if let bytes = sqlite3_column_blob(stmt, 0) {
-            existing = Data(bytes: bytes, count: length)
-        } else {
-            throw BrokerError.sqlFailed("read existing content")
+            let length = Int(sqlite3_column_bytes(stmt, 0))
+            if length == 0 {
+                return Data()
+            } else if let bytes = sqlite3_column_blob(stmt, 0) {
+                return Data(bytes: bytes, count: length)
+            } else {
+                throw BrokerError.sqlFailed("read existing content")
+            }
         }
-        guard existing != data else { return }
+        guard let existing, existing != data else { return }
         // Self-authenticating content is immutable; corrupt local bytes are repairable.
         if (try? SerializedVolume.validate(cid: cid, data: existing)) != nil {
             throw BrokerError.conflictingContent(cid)
@@ -388,8 +378,7 @@ struct CASVolumeStore: VolumeStorer {
     }
 
     private func verifyComplete(root: String, entryCount: Int) throws {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
+        let db = connection.db
         let sql = """
             SELECT 1
             FROM volume_metadata vm
@@ -398,15 +387,13 @@ struct CASVolumeStore: VolumeStorer {
               AND \(Self.completeVolumePredicate)
             LIMIT 1
             """
-        guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK,
-              let stmt else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+        try connection.withStatement(sql) { stmt in
+            sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+            sqlite3_bind_int64(stmt, 2, Int64(entryCount))
+            let result = sqlite3_step(stmt)
+            if result == SQLITE_ROW { return }
+            if result == SQLITE_DONE { throw BrokerError.conflictingVolume(root) }
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
         }
-        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
-        sqlite3_bind_int64(stmt, 2, Int64(entryCount))
-        let result = sqlite3_step(stmt)
-        if result == SQLITE_ROW { return }
-        if result == SQLITE_DONE { throw BrokerError.conflictingVolume(root) }
-        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
     }
 }
