@@ -10,7 +10,7 @@ import Darwin
 #endif
 @testable import VolumeBroker
 
-nonisolated(unsafe) private var casDeletesPrepared: Int32 = 0
+nonisolated(unsafe) private var casDeletesStarted: Int32 = 0
 
 /// Re-review probes: a process that dies inside a release, or anywhere in a
 /// run of body fetches and releases, and what the next process finds.
@@ -82,13 +82,14 @@ final class ScopeCrashTests: XCTestCase {
             try await retained.mergeRetainedRoots(scope: Self.chain, roots: [P.cid("state")])
             try await retained.mergeRetainedRoots(scope: Self.body("block-a"), roots: a)
             try await retained.mergeRetainedRoots(scope: Self.body("block-b"), roots: ["block-b", "shared-tx"].map(P.cid))
-            // The authorizer runs as each statement is prepared, and a release
-            // prepares its statements one at a time as it goes.
-            sqlite3_set_authorizer(connection.db, { _, action, table, _, _, _ in
-                guard action == SQLITE_DELETE, let table, String(cString: table) == "cas_data" else { return SQLITE_OK }
-                casDeletesPrepared += 1
-                if casDeletesPrepared == 4 { Darwin._exit(0) }
-                return SQLITE_OK
+            // The trace runs as each statement starts, before it changes
+            // anything, and a release runs its CAS deletes one at a time.
+            sqlite3_trace_v2(connection.db, UInt32(SQLITE_TRACE_STMT), { _, _, statement, _ in
+                guard let statement, let sql = sqlite3_sql(OpaquePointer(statement)),
+                      String(cString: sql).contains("DELETE FROM cas_data") else { return 0 }
+                casDeletesStarted += 1
+                if casDeletesStarted == 4 { Darwin._exit(0) }
+                return 0
             }, nil)
             _ = try await retained.releaseRetainedRoots(scope: Self.body("block-a"), roots: a)
             Darwin._exit(3)

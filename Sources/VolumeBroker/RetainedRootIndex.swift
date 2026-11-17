@@ -162,27 +162,25 @@ struct RetainedRootIndex {
 
     /// On the write connection, inside the caller's transaction.
     private func textColumn(_ sql: String, _ values: String...) throws -> [String] {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK,
-              let stmt,
-              values.indices.allSatisfy({
-                  sqlite3_bind_text(stmt, Int32($0 + 1), values[$0], -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK
-              }) else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        var result: [String] = []
-        while true {
-            switch sqlite3_step(stmt) {
-            case SQLITE_ROW:
-                guard let ptr = sqlite3_column_text(stmt, 0) else {
+        try connection.withStatement(sql) { stmt in
+            guard values.indices.allSatisfy({
+                sqlite3_bind_text(stmt, Int32($0 + 1), values[$0], -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK
+            }) else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+            }
+            var result: [String] = []
+            while true {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    guard let ptr = sqlite3_column_text(stmt, 0) else {
+                        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+                    }
+                    result.append(String(cString: ptr))
+                case SQLITE_DONE:
+                    return result
+                default:
                     throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
                 }
-                result.append(String(cString: ptr))
-            case SQLITE_DONE:
-                return result
-            default:
-                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
             }
         }
     }
@@ -288,7 +286,7 @@ struct RetainedRootIndex {
     }
 
     private func validateStoredVolume(root: String) throws {
-        guard try CASVolumeStore.isCompleteVolume(root: root, db: connection.db) else {
+        guard try CASVolumeStore.isCompleteVolume(root: root, connection: connection) else {
             throw BrokerError.missingRetainedRoot(root)
         }
     }
