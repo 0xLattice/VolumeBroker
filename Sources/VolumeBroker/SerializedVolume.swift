@@ -32,10 +32,11 @@ public extension SerializedVolume {
 /// Bytes are hashed once, where they enter. `init(validating:)` is that
 /// check, for bytes from anywhere the caller does not trust: a peer, an
 /// operator, another process. `init(trusting:)` takes the caller's word,
-/// for bytes it has already hashed: ones it serialized from its own nodes
-/// against their CIDs, ones it validated before, or ones read back from
-/// its own broker. Either way the Volume holds its own copy of the bytes,
-/// so what was checked is what is stored.
+/// for bytes this process has already hashed against their CIDs: ones it
+/// serialized from its own nodes, or ones it validated before. Bytes read
+/// back from a store are not that: a store serves damaged bytes as they
+/// are. Either way the Volume holds its own copy of the bytes, so what was
+/// checked is what is stored.
 public struct ValidatedVolume: Sendable {
     public let volume: SerializedVolume
 

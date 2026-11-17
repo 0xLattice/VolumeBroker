@@ -10,12 +10,15 @@ about chains.
 
 ## Contract
 
-- A Volume is visible only after its complete, CID-valid entry set commits.
+- A Volume is visible only after its complete entry set commits, CID-valid as
+  checked on its way in.
 - Bytes are hashed once, on their way in. A `SerializedVolume` is validated
   when stored; a `ValidatedVolume` is stored without hashing again, for bytes
   the caller already checked or made itself. Reads return the bytes as stored.
 - Valid CID bytes and Volume membership are immutable.
-- Reads may fall through `local -> near -> far`; writes target one broker.
+- Reads may fall through `local -> near -> far` for what a tier lacks; a
+  tier's damaged bytes are served, not fallen through. Writes target one
+  broker.
 - A retained or counted root keeps its own Volume and nothing nested under it;
   `sweep` removes every Volume no scope retains or counts.
 - Equal CIDs are deduplicated within each broker tier.

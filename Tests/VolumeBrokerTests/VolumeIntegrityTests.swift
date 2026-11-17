@@ -930,4 +930,17 @@ final class VolumeIntegrityTests: XCTestCase {
             XCTAssertEqual(served, bytes)
         }
     }
+
+    /// Damaged stored bytes are repaired by a validated Volume too: bytes
+    /// that differ from stored ones are hashed, stored and validated alike.
+    func testAValidatedVolumeRepairsDamagedStoredBytes() async throws {
+        try await withCorruptedStore(.corruptBytes) { _, store, root, child in
+            let repair = try ValidatedVolume(validating: SerializedVolume(
+                root: root, entries: [root: Data("root".utf8), child: Data("child".utf8)]
+            ))
+            try await store.storeVolumesLocal([repair], then: nil)
+            let repaired = await store.fetchDataLocal(cid: child)
+            XCTAssertEqual(repaired, Data("child".utf8))
+        }
+    }
 }
