@@ -48,6 +48,20 @@ struct CountedRootsTests {
 
     // MARK: - Shared behaviour
 
+    /// Releasing retained scopes keeps what a counted scope counts.
+    @Test(arguments: Kind.allCases)
+    func releasingRetainedScopesKeepsWhatIsCounted(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal(
+            [Self.volume("a"), Self.volume("b")], retaining: ["w:1": ["a", "b"].map(Self.cid)]
+        )
+        try await broker.adjustCountedRoots(
+            scope: "s", deltas: Self.counts(["a": 1]), marker: "m1", expectedMarker: nil)
+        #expect(try await broker.releaseRetainedScopes(["w:1"]) == 1)
+        #expect(await broker.hasVolume(root: Self.cid("a")))
+        #expect(await broker.hasVolume(root: Self.cid("b")) == false)
+    }
+
     @Test(arguments: Kind.allCases)
     func countsAccumulateAndTheMarkerMoves(kind: Kind) async throws {
         let broker = try Self.broker(kind)

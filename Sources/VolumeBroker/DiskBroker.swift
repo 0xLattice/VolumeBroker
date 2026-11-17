@@ -69,6 +69,13 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
         try await retainedRoots.mergeRetainedRoots(scope: scope, roots: roots)
     }
 
+    public func storeVolumesLocal(_ volumes: [SerializedVolume], retaining: [String: [String]]) async throws {
+        let merges = try RetainedRootIndex.canonicalMerges(retaining)
+        let index = self.retainedRoots
+        @Sendable func retain() throws { try index.merge(merges) }
+        try await self.volumes.storeVolumesLocal(volumes, then: merges.isEmpty ? nil : retain)
+    }
+
     public func retainedRoots(scope: String) async throws -> [String] {
         try await retainedRoots.retainedRoots(scope: scope)
     }
@@ -85,6 +92,11 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
 
     public func retainedScopes(prefix: String) async throws -> [String] {
         try await retainedRoots.retainedScopes(prefix: prefix)
+    }
+
+    @discardableResult
+    public func releaseRetainedScopes(_ scopes: [String]) async throws -> Int {
+        try await retainedRoots.releaseRetainedScopes(scopes)
     }
 
     // MARK: - Counted Roots

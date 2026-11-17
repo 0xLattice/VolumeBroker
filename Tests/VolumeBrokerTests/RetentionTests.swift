@@ -193,6 +193,58 @@ struct RetentionTests {
         #expect(await broker.hasVolume(root: Self.cid("state")))
     }
 
+    /// Stored and retained in one commit: what the batch stores is retained
+    /// where the caller says, with roots already stored; a root that would
+    /// not be complete refuses the whole of it.
+    @Test(arguments: Kind.allCases)
+    func storingAndRetainingIsOneCommit(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal([Self.volume("held", ["held-leaf"])])
+        try await broker.mergeRetainedRoots(scope: "keep", roots: [Self.cid("held")])
+        try await broker.storeVolumesLocal(
+            [Self.volume("a", ["a-leaf"]), Self.volume("b", ["b-leaf"])],
+            retaining: ["w:1": [Self.cid("a")], "w:2": ["b", "held"].map(Self.cid)]
+        )
+        #expect(try await broker.retainedRoots(scope: "w:1") == [Self.cid("a")])
+        #expect(try await broker.retainedRoots(scope: "w:2") == ["b", "held"].map(Self.cid).sorted())
+        #expect(try await broker.sweep() == 0)
+
+        await #expect(throws: BrokerError.missingRetainedRoot(Self.cid("absent"))) {
+            try await broker.storeVolumesLocal(
+                [Self.volume("c", ["c-leaf"])], retaining: ["w:3": ["c", "absent"].map(Self.cid)]
+            )
+        }
+        #expect(await broker.hasVolume(root: Self.cid("c")) == false)
+        #expect(await broker.fetchDataLocal(cid: Self.cid("c-leaf")) == nil)
+        #expect(try await broker.retainedScopes(prefix: "w:") == ["w:1", "w:2"])
+    }
+
+    /// Several scopes let go of in one commit: what only they retained goes,
+    /// what another scope retains stays, and a scope retaining nothing is no
+    /// error.
+    @Test(arguments: Kind.allCases)
+    func releasingScopesLetsGoOfWhatOnlyTheyRetain(kind: Kind) async throws {
+        let broker = try Self.broker(kind)
+        try await broker.storeVolumesLocal(
+            ["a", "b", "c", "shared"].map { Self.volume($0, ["\($0)-leaf"]) },
+            retaining: [
+                "w:1": ["a", "shared"].map(Self.cid),
+                "w:2": [Self.cid("b")],
+                "w:3": ["c", "shared"].map(Self.cid),
+            ]
+        )
+        #expect(try await broker.releaseRetainedScopes(["w:1", "w:2", "w:none"]) == 2)
+        #expect(try await broker.retainedScopes(prefix: "w:") == ["w:3"])
+        for gone in ["a", "b"] {
+            #expect(await broker.hasVolume(root: Self.cid(gone)) == false, "\(gone)")
+            #expect(await broker.fetchDataLocal(cid: Self.cid("\(gone)-leaf")) == nil, "\(gone)")
+        }
+        for kept in ["c", "shared"] {
+            #expect(await broker.hasVolume(root: Self.cid(kept)), "\(kept)")
+        }
+        #expect(try await broker.releaseRetainedScopes([]) == 0)
+    }
+
     /// A store written before bodies had scopes of their own names a body
     /// in the chain's scope too: releasing the block's scope keeps it.
     @Test(arguments: Kind.allCases)

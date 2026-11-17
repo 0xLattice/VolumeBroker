@@ -181,8 +181,16 @@ struct CASVolumeStore: VolumeStorer {
     }
 
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
+        try await storeVolumesLocal(volumes, then: nil)
+    }
+
+    /// Stores `volumes`, then runs `then` on the write connection, in one
+    /// transaction: a throw from either changes nothing.
+    func storeVolumesLocal(
+        _ volumes: [SerializedVolume], then: (@Sendable () throws -> Void)?
+    ) async throws {
         let batch = try Self.validateBatch(volumes)
-        guard !batch.volumes.isEmpty else { return }
+        guard !batch.volumes.isEmpty || then != nil else { return }
 
         try await connection.write {
             try connection.transaction {
@@ -207,6 +215,7 @@ struct CASVolumeStore: VolumeStorer {
                 for volume in batch.volumes {
                     try verifyComplete(root: volume.root, entryCount: volume.entries.count)
                 }
+                try then?()
             }
         }
     }

@@ -48,6 +48,13 @@ public protocol RetainedRootBroker: VolumeBroker {
 /// an existing scope without replacing or retransmitting the full scope.
 public protocol RetainedRootMergeBroker: RetainedRootBroker {
     func mergeRetainedRoots(scope: String, roots: [String]) async throws
+
+    /// In one transaction: store `volumes` as `storeVolumesLocal` does, then
+    /// merge each scope's roots in `retaining` as `mergeRetainedRoots` does.
+    /// Every root must be a complete stored Volume once `volumes` are in, or
+    /// nothing changes. What is stored and retained this way is never
+    /// stored and unretained, so no release or sweep can come between.
+    func storeVolumesLocal(_ volumes: [SerializedVolume], retaining: [String: [String]]) async throws
 }
 
 /// Optional retained-root surface for brokers that can let go of named roots
@@ -65,6 +72,14 @@ public protocol RetainedRootReleaseBroker: RetainedRootMergeBroker {
     /// `prefix`, sorted. A caller that keeps one scope per thing it holds
     /// finds the scopes it no longer has a reason for.
     func retainedScopes(prefix: String) async throws -> [String]
+
+    /// In one transaction: every root each of `scopes` retains leaves it,
+    /// then each of those Volumes no scope retains or counts is removed,
+    /// with the CAS rows that leaves unowned. A scope that retains nothing
+    /// is not an error. The work is in the roots the scopes retain. Returns
+    /// the number of Volumes removed.
+    @discardableResult
+    func releaseRetainedScopes(_ scopes: [String]) async throws -> Int
 }
 
 /// Optional retention surface of counted roots: per scope, a count for each
