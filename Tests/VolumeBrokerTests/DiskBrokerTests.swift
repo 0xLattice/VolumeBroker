@@ -500,6 +500,48 @@ struct DiskBrokerTests {
     /// store(volume:) calls can concurrently pass SQLITE_OPEN_FULLMUTEX's
     /// per-call serialisation and then both issue BEGIN IMMEDIATE, causing the
     /// second to fail with "cannot start a transaction within a transaction".
+    /// A read that starts while another read is still stepping sees every
+    /// commit that returned before it started, not the other read's
+    /// snapshot.
+    @Test func aReadOverlappingAnotherSeesCommitsMadeSinceItStarted() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskBrokerOverlap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let connection = try SQLiteConnection(path: directory.appendingPathComponent("volumes.sqlite").path)
+        let store = CASVolumeStore(connection: connection)
+        let index = RetainedRootIndex(connection: connection)
+        let volume = ScopeTests.volume("overlap", ["leaf"])
+        try await store.storeVolumesLocal([volume])
+        for i in 0..<3 { try await index.mergeRetainedRoots(scope: "early-\(i)", roots: [volume.root]) }
+
+        let stepping = DispatchSemaphore(value: 0)
+        let finish = DispatchSemaphore(value: 0)
+        // A long read: one row stepped, then held until told to finish.
+        let longRead = Task {
+            await connection.read {
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                sqlite3_prepare_v2(connection.readDb, "SELECT scope FROM retained_roots", -1, &stmt, nil)
+                let stepped = sqlite3_step(stmt) == SQLITE_ROW
+                stepping.signal()
+                finish.wait()
+                return stepped
+            }
+        }
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { stepping.wait(); continuation.resume() }
+        }
+        try await index.mergeRetainedRoots(scope: "late", roots: [volume.root])
+        let overlapping = Task { try await index.retainedRoots(scope: "late") }
+        // Long enough for a read that does not wait for the long one to have run.
+        try await Task.sleep(for: .milliseconds(200))
+        finish.signal()
+
+        #expect(await longRead.value)
+        #expect(try await overlapping.value == [volume.root])
+    }
+
     @Test("Concurrent writes from multiple actors do not produce nested-transaction errors")
     func testConcurrentWritesFromMultipleActors() async throws {
         let broker = try tempDB()

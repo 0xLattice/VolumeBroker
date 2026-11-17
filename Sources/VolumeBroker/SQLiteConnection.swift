@@ -16,12 +16,16 @@ let SQLITE_TRANSIENT_SHIM = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 final class SQLiteConnection: @unchecked Sendable {
     private static let schemaVersion = 2
 
-    private let readQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.read", qos: .utility, attributes: .concurrent)
+    /// Serial: a connection has one transaction, so a read started while
+    /// another read's statement is still stepping would join that read's
+    /// snapshot and miss commits made since. One read at a time, each in a
+    /// snapshot of its own, sees every commit that returned before it.
+    private let readQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.read", qos: .utility)
     private let writeQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.write", qos: .utility)
 
     /// Write connection — SQLITE_OPEN_FULLMUTEX serialises all SQL calls.
     let db: OpaquePointer
-    /// Separate read-only WAL connection — concurrent reads alongside writes.
+    /// Separate read-only WAL connection — reads alongside writes.
     let readDb: OpaquePointer
 
     init(path: String) throws {
@@ -81,7 +85,7 @@ final class SQLiteConnection: @unchecked Sendable {
 
     // MARK: - Serialised access
 
-    /// Run a read on the concurrent read queue against the read-only connection.
+    /// Run a read on the serial read queue against the read-only connection.
     func read<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
         await withCheckedContinuation { continuation in
             readQueue.async {
@@ -90,7 +94,7 @@ final class SQLiteConnection: @unchecked Sendable {
         }
     }
 
-    /// Run a throwing read on the concurrent read queue.
+    /// Run a throwing read on the serial read queue.
     func read<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
             readQueue.async {

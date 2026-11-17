@@ -40,7 +40,7 @@ struct CASVolumeStore: VolumeStorer {
         LIMIT 1
         """
 
-    /// On the read connection: reads run concurrently, so each prepares its own.
+    /// On the read connection: each read prepares its own.
     static func isCompleteVolume(root: String, db: OpaquePointer) throws -> Bool {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
