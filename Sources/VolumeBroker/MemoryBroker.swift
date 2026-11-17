@@ -65,13 +65,13 @@ public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
     }
 
     public func storeVolumesLocal(_ volumes: [SerializedVolume], retaining: [String: [String]]) async throws {
-        let volumes = volumes.map { $0.ownedCopy() }
-        for volume in volumes { try volume.validate() }
         let merges = try retaining.keys.sorted().map { scope in
             let roots = try Self.canonicalRetainedRoots(retaining[scope] ?? [])
             try Self.validateScope(scope)
             return (scope: scope, roots: roots)
         }
+        let volumes = volumes.map { $0.ownedCopy() }
+        for volume in volumes { try volume.validate() }
         guard !volumes.isEmpty || !merges.isEmpty else { return }
         try lock.withWriteLock {
             let newVolumes = try Self.preflight(volumes, state: state)
@@ -232,12 +232,11 @@ public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
 
     @discardableResult
     public func releaseRetainedScopes(_ scopes: [String]) async throws -> Int {
-        let keys = Set(scopes)
-        for scope in keys { try Self.validateScope(scope) }
+        for scope in scopes { try Self.validateScope(scope) }
 
         return lock.withWriteLock {
             var released = Set<String>()
-            for scope in keys {
+            for scope in scopes {
                 released.formUnion(state.retainedRoots.removeValue(forKey: Array(scope.utf8)) ?? [])
             }
             return Self.reclaim(roots: Array(released), state: &state)

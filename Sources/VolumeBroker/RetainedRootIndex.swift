@@ -111,7 +111,8 @@ struct RetainedRootIndex {
     /// one transaction on the serial write connection. The work is in the
     /// roots the scopes retain.
     func releaseRetainedScopes(_ scopes: [String]) async throws -> Int {
-        let scopes = Array(Set(scopes)).sorted()
+        // By their bytes: two spellings Swift calls equal are two scopes.
+        let scopes = Dictionary(scopes.map { (Array($0.utf8), $0) }) { first, _ in first }.values.sorted()
         for scope in scopes { try Self.validateScope(scope) }
         guard !scopes.isEmpty else { return 0 }
 
