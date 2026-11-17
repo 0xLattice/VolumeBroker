@@ -27,8 +27,8 @@ struct CASVolumeStore: VolumeStorer {
         """
 
     func hasVolume(root: String) async -> Bool {
-        await connection.read {
-            (try? Self.isCompleteVolume(root: root, db: connection.readDb)) ?? false
+        await connection.read { readDb in
+            (try? Self.isCompleteVolume(root: root, db: readDb)) ?? false
         }
     }
 
@@ -70,8 +70,8 @@ struct CASVolumeStore: VolumeStorer {
     /// on their way in. Bytes damaged since are served as they are, and a
     /// re-store of the right bytes overwrites them.
     func fetchVolumeLocal(root: String) async -> SerializedVolume? {
-        await connection.read {
-            (try? Self.loadVolume(root: root, db: connection.readDb)) ?? nil
+        await connection.read { readDb in
+            (try? Self.loadVolume(root: root, db: readDb)) ?? nil
         }
     }
 
@@ -126,8 +126,8 @@ struct CASVolumeStore: VolumeStorer {
     /// while using bounded SQLite parameter sets.
     func fetchDataLocal(cids: Set<String>) async -> [String: Data] {
         guard !cids.isEmpty else { return [:] }
-        let loaded: [String: Data]? = await connection.read {
-            try? Self.loadServableData(cids: cids, db: connection.readDb)
+        let loaded: [String: Data]? = await connection.read { readDb in
+            try? Self.loadServableData(cids: cids, db: readDb)
         }
         return loaded ?? [:]
     }

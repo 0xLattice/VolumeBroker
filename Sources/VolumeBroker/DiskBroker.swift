@@ -4,7 +4,7 @@ import Foundation
 ///
 /// `DiskBroker` composes the layered storage components and delegates to them;
 /// it owns no SQL itself. The layers are:
-///   - `SQLiteConnection`  — connection/PRAGMA/schema + serialised read/write access.
+///   - `SQLiteConnection`  — connection/PRAGMA/schema + serial writes, pooled reads.
 ///   - `CASVolumeStore`    — content-addressed volume store (store/fetch/has).
 ///   - `RetainedRootIndex` — named retained-root sets, release, and sweep.
 ///   - `CountedRootIndex`  — counted roots and their markers.

@@ -514,10 +514,10 @@ struct DiskBrokerTests {
         let finish = DispatchSemaphore(value: 0)
         // A long read: one row stepped, then held until told to finish.
         let longRead = Task {
-            await connection.read {
+            await connection.read { readDb in
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
-                sqlite3_prepare_v2(connection.readDb, "SELECT scope FROM retained_roots", -1, &stmt, nil)
+                sqlite3_prepare_v2(readDb, "SELECT scope FROM retained_roots", -1, &stmt, nil)
                 let stepped = sqlite3_step(stmt) == SQLITE_ROW
                 stepping.signal()
                 finish.wait()
@@ -535,6 +535,84 @@ struct DiskBrokerTests {
 
         #expect(await longRead.value)
         #expect(try await overlapping.value == [volume.root])
+    }
+
+    /// A cheap read does not wait for a long one: while one read holds a
+    /// read connection, `hasVolume` returns on another. The long read is
+    /// let go only by the cheap read's return, so on a read side that
+    /// serves one read at a time this never finishes. No wall-clock bound:
+    /// on a loaded runner the same work takes many times longer.
+    @Test func aCheapReadDoesNotWaitForALongOne() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskBrokerCheapRead-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let connection = try SQLiteConnection(path: directory.appendingPathComponent("volumes.sqlite").path)
+        let store = CASVolumeStore(connection: connection)
+        let volume = ScopeTests.volume("cheap", ["leaf"])
+        try await store.storeVolumesLocal([volume])
+
+        let started = DispatchSemaphore(value: 0)
+        let finish = DispatchSemaphore(value: 0)
+        // A long read, held until the cheap read has returned.
+        let longRead = Task {
+            await connection.read { _ in
+                started.signal()
+                finish.wait()
+            }
+        }
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { started.wait(); continuation.resume() }
+        }
+        let held = await store.hasVolume(root: volume.root)
+        finish.signal()
+        await longRead.value
+        #expect(held)
+    }
+
+    /// A read connection handed back holds no snapshot: with every other
+    /// reader held, the next read takes the same connection a read just
+    /// returned, and sees a commit made after that read.
+    @Test func aReturnedReaderSeesCommitsMadeAfterItsLastRead() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskBrokerReuse-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let connection = try SQLiteConnection(path: directory.appendingPathComponent("volumes.sqlite").path)
+        let store = CASVolumeStore(connection: connection)
+        let index = RetainedRootIndex(connection: connection)
+        let volume = ScopeTests.volume("reuse", ["leaf"])
+        try await store.storeVolumesLocal([volume])
+        for i in 0..<3 { try await index.mergeRetainedRoots(scope: "early-\(i)", roots: [volume.root]) }
+
+        // Hold every reader but one.
+        let held = DispatchSemaphore(value: 0)
+        let finish = DispatchSemaphore(value: 0)
+        let holders = (1..<SQLiteConnection.readerCount).map { _ in
+            Task { await connection.read { _ in held.signal(); finish.wait() } }
+        }
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                for _ in holders { held.wait() }
+                continuation.resume()
+            }
+        }
+        // The one free reader: a read that steps a row and returns.
+        let first = await connection.read { readDb -> UInt in
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_prepare_v2(readDb, "SELECT scope FROM retained_roots", -1, &stmt, nil)
+            _ = sqlite3_step(stmt)
+            return UInt(bitPattern: Int(bitPattern: UnsafeRawPointer(readDb)))
+        }
+        try await index.mergeRetainedRoots(scope: "late", roots: [volume.root])
+        let second = await connection.read { readDb in UInt(bitPattern: Int(bitPattern: UnsafeRawPointer(readDb))) }
+        let late = try await index.retainedRoots(scope: "late")
+
+        for _ in holders { finish.signal() }
+        for holder in holders { await holder.value }
+        #expect(first == second, "the read took another connection")
+        #expect(late == [volume.root])
     }
 
     /// Regression: DiskBroker is shared across multiple ChainNetwork actors.

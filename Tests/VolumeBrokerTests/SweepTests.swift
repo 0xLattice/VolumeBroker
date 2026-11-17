@@ -207,10 +207,12 @@ struct SweepTests {
 
     @Test func retainedRootReadPropagatesSQLFailure() async throws {
         let h = try harness()
-        #expect(sqlite3_set_authorizer(h.connection.readDb, { _, action, _, _, _, _ in
-            action == SQLITE_READ ? SQLITE_DENY : SQLITE_OK
-        }, nil) == SQLITE_OK)
-        defer { sqlite3_set_authorizer(h.connection.readDb, nil, nil) }
+        for reader in h.connection.readers {
+            #expect(sqlite3_set_authorizer(reader, { _, action, _, _, _, _ in
+                action == SQLITE_READ ? SQLITE_DENY : SQLITE_OK
+            }, nil) == SQLITE_OK)
+        }
+        defer { for reader in h.connection.readers { sqlite3_set_authorizer(reader, nil, nil) } }
 
         do {
             _ = try await h.retained.retainedRoots(scope: "canonical")
@@ -300,11 +302,11 @@ struct SweepTests {
         let removed = try await h.retained.sweep()
 
         let statements = traced.statements
-        let plan = await h.connection.read {
+        let plan = await h.connection.read { readDb in
             statements.flatMap { sql -> [String] in
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
-                guard sqlite3_prepare_v2(h.connection.readDb, "EXPLAIN QUERY PLAN " + sql, -1, &stmt, nil) == SQLITE_OK,
+                guard sqlite3_prepare_v2(readDb, "EXPLAIN QUERY PLAN " + sql, -1, &stmt, nil) == SQLITE_OK,
                       let stmt else { return ["unexplained: \(sql)"] }
                 var details: [String] = []
                 while sqlite3_step(stmt) == SQLITE_ROW {
@@ -318,21 +320,21 @@ struct SweepTests {
     }
 
     private func count(_ connection: SQLiteConnection, _ sql: String) async -> Int {
-        await connection.read {
+        await connection.read { readDb in
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK, let stmt,
+            guard sqlite3_prepare_v2(readDb, sql, -1, &stmt, nil) == SQLITE_OK, let stmt,
                   sqlite3_step(stmt) == SQLITE_ROW else { return -1 }
             return Int(sqlite3_column_int64(stmt, 0))
         }
     }
 
     private func casRowCount(connection: SQLiteConnection, cid: String) async -> Int {
-        await connection.read {
+        await connection.read { readDb in
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare_v2(
-                connection.readDb,
+                readDb,
                 "SELECT COUNT(*) FROM cas_data WHERE cid = ?1",
                 -1,
                 &stmt,
