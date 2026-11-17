@@ -19,12 +19,48 @@ public extension SerializedVolume {
     /// A stored Volume must contain its declared root and every `(CID, bytes)` pair
     /// must be self-authenticating.
     func validate() throws {
-        guard !root.isEmpty else { throw SerializedVolumeError.emptyRoot }
-        guard entries[root] != nil else { throw SerializedVolumeError.missingRootEntry(root) }
-
+        try validateStructure()
         for (rawCID, data) in entries {
             try Self.validate(cid: rawCID, data: data)
         }
+    }
+}
+
+/// A Volume a broker stores without hashing its entries again: its
+/// structure is checked, and its bytes are known to match their CIDs.
+///
+/// Bytes are hashed once, where they enter. `init(validating:)` is that
+/// check, for bytes from anywhere the caller does not trust: a peer, an
+/// operator, another process. `init(trusting:)` takes the caller's word,
+/// for bytes this process has already hashed against their CIDs: ones it
+/// serialized from its own nodes, or ones it validated before. Bytes read
+/// back from a store are not that: a store serves damaged bytes as they
+/// are. Either way the Volume holds its own copy of the bytes, so what was
+/// checked is what is stored.
+public struct ValidatedVolume: Sendable {
+    public let volume: SerializedVolume
+
+    /// Checks the Volume's structure and that every entry's bytes hash to
+    /// its CID.
+    public init(validating volume: SerializedVolume) throws {
+        let owned = volume.ownedCopy()
+        try owned.validate()
+        self.volume = owned
+    }
+
+    /// Checks the Volume's structure only: every entry's bytes are taken
+    /// to hash to its CID, unchecked.
+    public init(trusting volume: SerializedVolume) throws {
+        let owned = volume.ownedCopy()
+        try owned.validateStructure()
+        self.volume = owned
+    }
+}
+
+extension SerializedVolume {
+    func validateStructure() throws {
+        guard !root.isEmpty else { throw SerializedVolumeError.emptyRoot }
+        guard entries[root] != nil else { throw SerializedVolumeError.missingRootEntry(root) }
     }
 }
 

@@ -156,7 +156,7 @@ struct Benchmarks {
         #expect(hits == 5_000)
     }
 
-    @Test func largeVolumePresenceAndPointReadsAvoidWholeVolumeValidation() async throws {
+    @Test func largeVolumePresenceAndPointReads() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeBrokerPointRead-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -186,8 +186,7 @@ struct Benchmarks {
 
         #expect(await store.hasVolume(root: volume.root))
         #expect(await store.fetchDataLocal(cid: target) == expected)
-        #expect(await store.fetchDataLocal(cid: corruptSibling) == nil)
-        #expect(await store.fetchVolumeLocal(root: volume.root) == nil)
+        #expect(await store.fetchDataLocal(cid: corruptSibling) == Data([0]))
     }
 
     // MARK: - Sweep

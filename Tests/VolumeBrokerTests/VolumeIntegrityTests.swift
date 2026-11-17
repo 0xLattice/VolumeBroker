@@ -755,21 +755,21 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
-    /// Corrupt bytes fail CID validation on read and are not served. Nothing
-    /// is flagged or deleted: presence stays structural and valid siblings stay
-    /// readable.
-    func testCorruptBytesAreNotServedAndNothingElseChanges() async throws {
+    /// A read serves the bytes as stored and does not hash them: they were
+    /// checked on their way in. Bytes damaged since are served as they are,
+    /// to be caught by whoever checks them against their CID. Nothing is
+    /// flagged or deleted.
+    func testCorruptBytesAreServedAsStoredAndNothingElseChanges() async throws {
         try await withCorruptedStore(.corruptBytes) { connection, store, root, child in
+            let damaged = Data([0])
             let volume = await store.fetchVolumeLocal(root: root)
             let corruptData = await store.fetchDataLocal(cid: child)
             let batch = await store.fetchDataLocal(cids: [root, child])
-            let validData = await store.fetchDataLocal(cid: root)
             let present = await store.hasVolume(root: root)
-            XCTAssertNil(volume)
-            XCTAssertNil(corruptData)
-            XCTAssertEqual(batch, [root: Data("root".utf8)])
-            XCTAssertEqual(validData, Data("root".utf8))
-            XCTAssertTrue(present, "presence is structural and does not hash every entry")
+            XCTAssertEqual(volume?.entries, [root: Data("root".utf8), child: damaged])
+            XCTAssertEqual(corruptData, damaged)
+            XCTAssertEqual(batch, [root: Data("root".utf8), child: damaged])
+            XCTAssertTrue(present)
 
             let preserved = try await connection.read {
                 (
@@ -782,33 +782,6 @@ final class VolumeIntegrityTests: XCTestCase {
             XCTAssertEqual(preserved.1, 2)
             XCTAssertEqual(preserved.2, 2)
         }
-    }
-
-    func testCorruptSharedContentFailsEveryOwningVolumeRead() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let connection = try SQLiteConnection(path: directory.appendingPathComponent("volumes.sqlite").path)
-        let store = CASVolumeStore(connection: connection)
-        let firstData = Data("first".utf8)
-        let secondData = Data("second".utf8)
-        let sharedData = Data("shared".utf8)
-        let first = try cid(for: firstData)
-        let second = try cid(for: secondData)
-        let shared = try cid(for: sharedData)
-        try await store.storeVolumesLocal([
-            SerializedVolume(root: first, entries: [first: firstData, shared: sharedData]),
-            SerializedVolume(root: second, entries: [second: secondData, shared: sharedData]),
-        ])
-        try await connection.write {
-            try connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(shared)'")
-        }
-
-        let firstVolume = await store.fetchVolumeLocal(root: first)
-        let secondVolume = await store.fetchVolumeLocal(root: second)
-        XCTAssertNil(firstVolume)
-        XCTAssertNil(secondVolume)
     }
 
     func testRetentionAdmissionUsesStructuralCompleteness() async throws {
@@ -849,9 +822,7 @@ final class VolumeIntegrityTests: XCTestCase {
         }
 
         let corruptShared = await store.fetchDataLocal(cid: shared)
-        let firstBeforeRepair = await store.fetchVolumeLocal(root: first)
-        XCTAssertNil(corruptShared)
-        XCTAssertNil(firstBeforeRepair)
+        XCTAssertEqual(corruptShared, Data([0]))
 
         try await store.store(volume: secondVolume)
         let repairedShared = await store.fetchDataLocal(cid: shared)
@@ -888,5 +859,88 @@ final class VolumeIntegrityTests: XCTestCase {
         let orphanBytes = await store.fetchDataLocal(cid: orphan)
         XCTAssertEqual(ownedBytes, childData)
         XCTAssertNil(orphanBytes)
+    }
+
+    func testValidatedVolumeChecksStructureAndHashesOnlyWhenValidating() throws {
+        let bytes = Data("expected".utf8)
+        let root = try cid(for: bytes)
+        let wrong = SerializedVolume(root: root, entries: [root: Data("wrong".utf8)])
+
+        XCTAssertThrowsError(try ValidatedVolume(validating: wrong)) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(root))
+        }
+        XCTAssertEqual(try ValidatedVolume(trusting: wrong).volume.entries, wrong.entries)
+
+        XCTAssertThrowsError(try ValidatedVolume(trusting: SerializedVolume(root: "", entries: [root: bytes]))) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .emptyRoot)
+        }
+        let other = try cid(for: Data("other".utf8))
+        XCTAssertThrowsError(try ValidatedVolume(trusting: SerializedVolume(root: other, entries: [root: bytes]))) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .missingRootEntry(other))
+        }
+    }
+
+    /// A validated Volume is stored on the caller's word: neither broker
+    /// hashes its entries again, alone or retained.
+    func testBrokersStoreAValidatedVolumeWithoutHashingIt() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let brokers: [any RetainedRootMergeBroker] = [MemoryBroker(), try DiskBroker(path: path)]
+        let first = try cid(for: Data("first".utf8))
+        let second = try cid(for: Data("second".utf8))
+        let unhashed = [first, second].map { SerializedVolume(root: $0, entries: [$0: Data("wrong".utf8)]) }
+
+        for broker in brokers {
+            do {
+                try await broker.storeVolumesLocal([unhashed[0]])
+                XCTFail("an unvalidated Volume is hashed")
+            } catch {
+                XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(first))
+            }
+            try await broker.storeVolumesLocal([try ValidatedVolume(trusting: unhashed[0])])
+            try await broker.storeVolumesLocal([try ValidatedVolume(trusting: unhashed[1])], retaining: ["s": [second]])
+            let served = await broker.fetchDataLocal(cids: [first, second])
+            let retained = try await broker.retainedRoots(scope: "s")
+            XCTAssertEqual(served, [first: Data("wrong".utf8), second: Data("wrong".utf8)])
+            XCTAssertEqual(retained, [second])
+        }
+    }
+
+    /// Bytes a caller vouches for still cannot replace valid stored bytes:
+    /// differing bytes are checked, and only damaged ones are repaired.
+    func testAValidatedVolumeCannotReplaceValidStoredBytes() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let brokers: [any VolumeBroker] = [MemoryBroker(), try DiskBroker(path: path)]
+        let bytes = Data("stored".utf8)
+        let root = try cid(for: bytes)
+        let wrong = try ValidatedVolume(trusting: SerializedVolume(root: root, entries: [root: Data("wrong".utf8)]))
+
+        for broker in brokers {
+            try await broker.store(volume: SerializedVolume(root: root, entries: [root: bytes]))
+            do {
+                try await broker.storeVolumesLocal([wrong])
+                XCTFail("valid stored bytes were replaced")
+            } catch {
+                XCTAssertEqual(error as? BrokerError, .conflictingContent(root))
+            }
+            let served = await broker.fetchDataLocal(cid: root)
+            XCTAssertEqual(served, bytes)
+        }
+    }
+
+    /// Damaged stored bytes are repaired by a validated Volume too: bytes
+    /// that differ from stored ones are hashed, stored and validated alike.
+    func testAValidatedVolumeRepairsDamagedStoredBytes() async throws {
+        try await withCorruptedStore(.corruptBytes) { _, store, root, child in
+            let repair = try ValidatedVolume(validating: SerializedVolume(
+                root: root, entries: [root: Data("root".utf8), child: Data("child".utf8)]
+            ))
+            try await store.storeVolumesLocal([repair], then: nil)
+            let repaired = await store.fetchDataLocal(cid: child)
+            XCTAssertEqual(repaired, Data("child".utf8))
+        }
     }
 }
