@@ -8,6 +8,8 @@ public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
     var far: (any VolumeBroker)? { get }
 
     func hasVolume(root: String) async -> Bool
+    /// The complete Volume, with its bytes as stored: a read does not hash
+    /// them again, as they were checked on their way in.
     func fetchVolumeLocal(root: String) async -> SerializedVolume?
     /// Fetch a single node's bytes by its CID when at least one complete local
     /// Volume owns it. The default handles the case where the CID is a root;
@@ -15,9 +17,12 @@ public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
     func fetchDataLocal(cid: String) async -> Data?
     /// Fetch multiple locally owned entries in one backend pass.
     func fetchDataLocal(cids: Set<String>) async -> [String: Data]
-    /// Publish the batch all-or-none. A durable broker returns only after the
-    /// batch survives a crash.
+    /// Validate each Volume, then publish the batch all-or-none. A durable
+    /// broker returns only after the batch survives a crash.
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws
+    /// `storeVolumesLocal(_:)` for Volumes already validated: no entry is
+    /// hashed again.
+    func storeVolumesLocal(_ volumes: [ValidatedVolume]) async throws
 }
 
 /// Retention surface: named scopes of retained Volume roots.
@@ -55,6 +60,18 @@ public protocol RetainedRootMergeBroker: RetainedRootBroker {
     /// nothing changes. What is stored and retained this way is never
     /// stored and unretained, so no release or sweep can come between.
     func storeVolumesLocal(_ volumes: [SerializedVolume], retaining: [String: [String]]) async throws
+
+    /// `storeVolumesLocal(_:retaining:)` for Volumes already validated: no
+    /// entry is hashed again.
+    func storeVolumesLocal(_ volumes: [ValidatedVolume], retaining: [String: [String]]) async throws
+}
+
+public extension RetainedRootMergeBroker {
+    /// For a broker that does not skip the check: its Volumes are validated
+    /// again.
+    func storeVolumesLocal(_ volumes: [ValidatedVolume], retaining: [String: [String]]) async throws {
+        try await storeVolumesLocal(volumes.map(\.volume), retaining: retaining)
+    }
 }
 
 /// Optional retained-root surface for brokers that can let go of named roots
@@ -123,6 +140,12 @@ public protocol CountedRootBroker: RetainedRootReleaseBroker {
 }
 
 public extension VolumeBroker {
+    /// For a broker that does not skip the check: its Volumes are validated
+    /// again.
+    func storeVolumesLocal(_ volumes: [ValidatedVolume]) async throws {
+        try await storeVolumesLocal(volumes.map(\.volume))
+    }
+
     func store(volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])
     }

@@ -125,8 +125,8 @@ struct SweepTests {
         #expect(await h.store.fetchVolumeLocal(root: root)?.entries == volume("r1").entries)
     }
 
-    /// Corrupt bytes are not served and flag nothing, so a read of a corrupt
-    /// leaf never shrinks what a sweep keeps.
+    /// Corrupt bytes are served as stored and flag nothing, so a read of a
+    /// corrupt leaf never shrinks what a sweep keeps.
     @Test func corruptLeafReadThenSweepRemovesNothingRetained() async throws {
         let h = try harness()
         let top = SerializedVolume(root: cid("top"), entries: [
@@ -140,8 +140,7 @@ struct SweepTests {
         try await h.connection.write {
             try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(cid("top-leaf"))'")
         }
-        #expect(await h.store.fetchDataLocal(cid: cid("top-leaf")) == nil)
-        #expect(await h.store.fetchVolumeLocal(root: top.root) == nil)
+        #expect(await h.store.fetchDataLocal(cid: cid("top-leaf")) == Data([0]))
 
         #expect(try await h.retained.sweep() == 0)
         #expect(await h.store.fetchVolumeLocal(root: mid.root)?.entries == mid.entries)

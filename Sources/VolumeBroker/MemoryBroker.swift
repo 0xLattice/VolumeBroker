@@ -64,14 +64,29 @@ public final class MemoryBroker: @unchecked Sendable, CountedRootBroker {
         try await storeVolumesLocal(volumes, retaining: [:])
     }
 
+    public func storeVolumesLocal(_ volumes: [ValidatedVolume]) async throws {
+        try await storeVolumesLocal(volumes, retaining: [:])
+    }
+
     public func storeVolumesLocal(_ volumes: [SerializedVolume], retaining: [String: [String]]) async throws {
-        let merges = try retaining.keys.sorted().map { scope in
+        let merges = try Self.canonicalMerges(retaining)
+        try store(volumes.map(ValidatedVolume.init(validating:)), merges: merges)
+    }
+
+    public func storeVolumesLocal(_ volumes: [ValidatedVolume], retaining: [String: [String]]) async throws {
+        try store(volumes, merges: try Self.canonicalMerges(retaining))
+    }
+
+    private static func canonicalMerges(_ retaining: [String: [String]]) throws -> [(scope: String, roots: [String])] {
+        try retaining.keys.sorted().map { scope in
             let roots = try Self.canonicalRetainedRoots(retaining[scope] ?? [])
             try Self.validateScope(scope)
             return (scope: scope, roots: roots)
         }
-        let volumes = volumes.map { $0.ownedCopy() }
-        for volume in volumes { try volume.validate() }
+    }
+
+    private func store(_ validated: [ValidatedVolume], merges: [(scope: String, roots: [String])]) throws {
+        let volumes = validated.map(\.volume)
         guard !volumes.isEmpty || !merges.isEmpty else { return }
         try lock.withWriteLock {
             let newVolumes = try Self.preflight(volumes, state: state)

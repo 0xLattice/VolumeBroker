@@ -59,6 +59,10 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
         try await self.volumes.storeVolumesLocal(volumes)
     }
 
+    public func storeVolumesLocal(_ volumes: [ValidatedVolume]) async throws {
+        try await self.volumes.storeVolumesLocal(volumes, then: nil)
+    }
+
     // MARK: - Retained Roots
 
     public func advanceRetainedRoots(scope: String, roots: [String]) async throws {
@@ -71,6 +75,14 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
 
     public func storeVolumesLocal(_ volumes: [SerializedVolume], retaining: [String: [String]]) async throws {
         let merges = try RetainedRootIndex.canonicalMerges(retaining)
+        try await store(volumes.map(ValidatedVolume.init(validating:)), merges: merges)
+    }
+
+    public func storeVolumesLocal(_ volumes: [ValidatedVolume], retaining: [String: [String]]) async throws {
+        try await store(volumes, merges: try RetainedRootIndex.canonicalMerges(retaining))
+    }
+
+    private func store(_ volumes: [ValidatedVolume], merges: [(scope: String, roots: [String])]) async throws {
         let index = self.retainedRoots
         @Sendable func retain() throws { try index.merge(merges) }
         try await self.volumes.storeVolumesLocal(volumes, then: merges.isEmpty ? nil : retain)

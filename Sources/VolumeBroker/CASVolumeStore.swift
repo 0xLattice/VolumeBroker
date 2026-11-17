@@ -53,15 +53,16 @@ struct CASVolumeStore: VolumeStorer {
         throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
     }
 
-    /// A Volume with any CID-invalid member is not served; a valid re-store
-    /// overwrites the corrupt bytes.
+    /// The bytes are served as stored, not hashed again: they were checked
+    /// on their way in. Bytes damaged since are served as they are, and a
+    /// re-store of the right bytes overwrites them.
     func fetchVolumeLocal(root: String) async -> SerializedVolume? {
         await connection.read {
-            (try? Self.loadValidatedVolume(root: root, db: connection.readDb)) ?? nil
+            (try? Self.loadVolume(root: root, db: connection.readDb)) ?? nil
         }
     }
 
-    static func loadValidatedVolume(root: String, db: OpaquePointer) throws -> SerializedVolume? {
+    static func loadVolume(root: String, db: OpaquePointer) throws -> SerializedVolume? {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         let sql = """
@@ -99,9 +100,7 @@ struct CASVolumeStore: VolumeStorer {
                 return nil
             }
         }
-        guard !entries.isEmpty,
-              entries.allSatisfy({ (try? SerializedVolume.validate(cid: $0.key, data: $0.value)) != nil })
-        else { return nil }
+        guard !entries.isEmpty else { return nil }
         return SerializedVolume(root: root, entries: entries)
     }
 
@@ -110,17 +109,14 @@ struct CASVolumeStore: VolumeStorer {
         await fetchDataLocal(cids: [cid])[cid]
     }
 
-    /// A batched point read preserves the same serve gate and CID validation as
-    /// scalar reads while using bounded SQLite parameter sets.
+    /// A batched point read preserves the same serve gate as scalar reads
+    /// while using bounded SQLite parameter sets.
     func fetchDataLocal(cids: Set<String>) async -> [String: Data] {
         guard !cids.isEmpty else { return [:] }
         let loaded: [String: Data]? = await connection.read {
             try? Self.loadServableData(cids: cids, db: connection.readDb)
         }
-        guard let loaded else { return [:] }
-        return loaded.filter { cid, data in
-            (try? SerializedVolume.validate(cid: cid, data: data)) != nil
-        }
+        return loaded ?? [:]
     }
 
     private static func loadServableData(
@@ -181,13 +177,13 @@ struct CASVolumeStore: VolumeStorer {
     }
 
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
-        try await storeVolumesLocal(volumes, then: nil)
+        try await storeVolumesLocal(volumes.map(ValidatedVolume.init(validating:)), then: nil)
     }
 
     /// Stores `volumes`, then runs `then` on the write connection, in one
     /// transaction: a throw from either changes nothing.
     func storeVolumesLocal(
-        _ volumes: [SerializedVolume], then: (@Sendable () throws -> Void)?
+        _ volumes: [ValidatedVolume], then: (@Sendable () throws -> Void)?
     ) async throws {
         let batch = try Self.validateBatch(volumes)
         guard !batch.volumes.isEmpty || then != nil else { return }
@@ -225,14 +221,13 @@ struct CASVolumeStore: VolumeStorer {
         let contentByCID: [String: Data]
     }
 
-    private static func validateBatch(_ submitted: [SerializedVolume]) throws -> ValidatedBatch {
+    private static func validateBatch(_ submitted: [ValidatedVolume]) throws -> ValidatedBatch {
         var memberships: [String: Set<String>] = [:]
         var contentByCID: [String: Data] = [:]
         var volumes: [SerializedVolume] = []
 
         for submittedVolume in submitted {
-            let volume = submittedVolume.ownedCopy()
-            try volume.validate()
+            let volume = submittedVolume.volume
             let members = Set(volume.entries.keys)
             if let existing = memberships[volume.root] {
                 guard existing == members else {
