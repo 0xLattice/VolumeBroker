@@ -31,7 +31,10 @@ enum SyncCountingVFS {
         wrapper.pointee.zName = UnsafePointer(strdup("sync-counting"))
         wrapper.pointee.pNext = nil
         wrapper.pointee.xOpen = { _, name, file, flags, outFlags in
-            guard let base = SyncCountingVFS.base, let open = base.pointee.xOpen else { return SQLITE_ERROR }
+            SyncCountingVFS.lock.lock()
+            let wrapped = SyncCountingVFS.base
+            SyncCountingVFS.lock.unlock()
+            guard let base = wrapped, let open = base.pointee.xOpen else { return SQLITE_ERROR }
             let status = open(base, name, file, flags, outFlags)
             guard status == SQLITE_OK, let file, let methods = file.pointee.pMethods else { return status }
             SyncCountingVFS.lock.lock()
