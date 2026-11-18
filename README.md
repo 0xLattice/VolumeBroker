@@ -148,9 +148,13 @@ counts and marker and reclaims what nothing else keeps.
 
 - `MemoryBroker` is the in-memory twin with identical retention and counting
   semantics.
-- `DiskBroker` uses SQLite, WAL, foreign keys, and schema v3 validation. With
-  `synchronous=FULL`, each commit is fsynced to the WAL before it returns, so a
-  `store` that returns survives a crash.
+- `DiskBroker` uses SQLite, WAL, foreign keys, and schema v3 validation. By
+  default (`durability: .everyCommit`, `synchronous=FULL`) each commit is
+  fsynced to the WAL before it returns, so a `store` that returns survives a
+  crash. Opened `durability: .deferred`, a commit does not wait for its fsync:
+  writes stay atomic and ordered, a crash of the process loses nothing, and a
+  power loss loses the writes since the last `flush()` or checkpoint. That
+  suits a store whose content can be fetched again.
 - Every broker is directly usable as Cashew's `VolumeStorer`, `ContentSource`,
   and `Fetcher`.
 

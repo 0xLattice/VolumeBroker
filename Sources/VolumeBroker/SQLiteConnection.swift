@@ -37,7 +37,13 @@ final class SQLiteConnection: @unchecked Sendable {
     private let freeReadersLock = NSLock()
     private let readerPermits = DispatchSemaphore(value: readerCount)
 
-    init(path: String) throws {
+    /// When a commit is durable (`BrokerDurability`).
+    let durability: BrokerDurability
+    private let walPath: String
+
+    init(path: String, durability: BrokerDurability = .everyCommit) throws {
+        self.durability = durability
+        self.walPath = path + "-wal"
         var handle: OpaquePointer?
         // FULLMUTEX: serialize all SQLite calls on this connection so that
         // the actor's task-to-thread migrations under Swift concurrency cannot
@@ -51,7 +57,7 @@ final class SQLiteConnection: @unchecked Sendable {
         do {
             try Self.execRaw(db: handle, "PRAGMA busy_timeout=30000")
             try Self.initializeSchemaIfNeeded(db: handle)
-            try Self.configureWriteConnection(db: handle)
+            try Self.configureWriteConnection(db: handle, durability: durability)
         } catch {
             sqlite3_close(handle)
             throw error
@@ -155,6 +161,30 @@ final class SQLiteConnection: @unchecked Sendable {
     func checkpoint() async {
         _ = try? await write { [self] in
             sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_TRUNCATE, nil, nil)
+        }
+    }
+
+    /// Makes every commit that has returned durable. With `.everyCommit`
+    /// each already is, and this does nothing.
+    ///
+    /// With `.deferred` a commit is appended to the WAL and not synced. What
+    /// a checkpoint has moved into the database file SQLite synced then, so
+    /// what is not yet durable is in the WAL, and syncing that file makes it
+    /// so. It runs on the write queue, after every write queued before it and
+    /// never during a checkpoint, which the committing connection runs there.
+    func flush() async throws {
+        guard durability == .deferred else { return }
+        try await write { [walPath] in
+            let descriptor = open(walPath, O_RDONLY)
+            guard descriptor >= 0 else {
+                // No WAL file: nothing is waiting in one.
+                if errno == ENOENT { return }
+                throw BrokerError.sqlFailed("WAL not opened to sync: \(String(cString: strerror(errno)))")
+            }
+            defer { close(descriptor) }
+            guard fsync(descriptor) == 0 else {
+                throw BrokerError.sqlFailed("WAL not synced: \(String(cString: strerror(errno)))")
+            }
         }
     }
 
@@ -457,16 +487,21 @@ final class SQLiteConnection: @unchecked Sendable {
         return normalized
     }
 
-    private static func configureWriteConnection(db: OpaquePointer) throws {
+    private static func configureWriteConnection(db: OpaquePointer, durability: BrokerDurability) throws {
         try enableForeignKeys(db: db)
         guard try scalarText(db: db, "PRAGMA journal_mode=WAL").lowercased() == "wal" else {
             throw BrokerError.sqlFailed("SQLite journal_mode=WAL unavailable")
         }
         // Reads and writes wait out short WAL/checkpoint contention windows.
         try execRaw(db: db, "PRAGMA busy_timeout=5000")
-        try execRaw(db: db, "PRAGMA synchronous=FULL")
-        guard try scalarInt(db: db, "PRAGMA synchronous") == 2 else {
-            throw BrokerError.sqlFailed("SQLite synchronous=FULL unavailable")
+        // FULL syncs the WAL at every commit. NORMAL does not: a commit is
+        // atomic and ordered, a crash of the process loses nothing, and a
+        // power loss loses the commits since the last sync, never part of
+        // one (`BrokerDurability.deferred`, `flush`).
+        let (mode, level) = durability == .everyCommit ? ("FULL", 2) : ("NORMAL", 1)
+        try execRaw(db: db, "PRAGMA synchronous=\(mode)")
+        guard try scalarInt(db: db, "PRAGMA synchronous") == level else {
+            throw BrokerError.sqlFailed("SQLite synchronous=\(mode) unavailable")
         }
         try execRaw(db: db, "PRAGMA cache_size=-65536")
         try execRaw(db: db, "PRAGMA mmap_size=268435456")
