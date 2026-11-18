@@ -285,7 +285,12 @@ struct SweepTests {
         #expect(await casRowCount(connection: h.connection, cid: cid(for: leaf)) == 1)
     }
 
-    private final class TracedSQL: @unchecked Sendable { var statements: [String] = [] }
+    private final class TracedSQL: @unchecked Sendable {
+        private let lock = NSLock()
+        private var traced: [String] = []
+        func append(_ sql: String) { lock.lock(); traced.append(sql); lock.unlock() }
+        var statements: [String] { lock.lock(); defer { lock.unlock() }; return traced }
+    }
 
     /// Sweep with every statement the write connection prepares traced, and
     /// return the query plan details of those statements.
@@ -294,7 +299,7 @@ struct SweepTests {
         sqlite3_trace_v2(h.connection.db, UInt32(SQLITE_TRACE_STMT), { _, context, statement, _ in
             let traced = Unmanaged<TracedSQL>.fromOpaque(context!).takeUnretainedValue()
             if let statement, let sql = sqlite3_sql(OpaquePointer(statement)) {
-                traced.statements.append(String(cString: sql))
+                traced.append(String(cString: sql))
             }
             return 0
         }, Unmanaged.passUnretained(traced).toOpaque())
