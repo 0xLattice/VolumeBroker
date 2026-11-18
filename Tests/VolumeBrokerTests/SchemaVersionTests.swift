@@ -69,7 +69,7 @@ struct SchemaVersionTests {
         return try CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
     }
 
-    @Test func freshDatabaseInitializesV2AndReopens() async throws {
+    @Test func freshDatabaseInitializesV3AndReopens() async throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         let data = Data("root".utf8)
@@ -81,7 +81,7 @@ struct SchemaVersionTests {
 
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
-            #expect(version == 2)
+            #expect(version == 3)
         }
 
         let reopened = try DiskBroker(path: location.path)
@@ -89,7 +89,7 @@ struct SchemaVersionTests {
         #expect(await broker.hasVolume(root: root))
     }
 
-    @Test func equivalentWhitespaceV2MetadataSchemaReopens() throws {
+    @Test func equivalentWhitespaceV3MetadataSchemaReopens() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         _ = try DiskBroker(path: location.path)
@@ -99,6 +99,7 @@ struct SchemaVersionTests {
                 CREATE TABLE volume_metadata
                 (root TEXT PRIMARY KEY, entry_count INTEGER NOT NULL
                 CHECK (typeof(entry_count) = 'integer'   AND entry_count > 0))
+                WITHOUT   ROWID
                 """)
         }
 
@@ -195,7 +196,7 @@ struct SchemaVersionTests {
         #expect(brokers.count == 16)
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
-            #expect(version == 2)
+            #expect(version == 3)
         }
     }
 
@@ -226,7 +227,7 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("nonempty v0 database must require migration")
         } catch {
-            #expect(error as? BrokerError == .migrationRequired(found: 0, required: 2))
+            #expect(error as? BrokerError == .migrationRequired(found: 0, required: 3))
         }
 
         try withDatabase(at: location.path) { db in
@@ -260,7 +261,7 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("v1 schema must fail closed")
         } catch {
-            #expect(error as? BrokerError == .migrationRequired(found: 1, required: 2))
+            #expect(error as? BrokerError == .migrationRequired(found: 1, required: 3))
         }
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
@@ -270,7 +271,193 @@ struct SchemaVersionTests {
         }
     }
 
+    /// v2 kept `volume_metadata` in a rowid b-tree beside its primary key,
+    /// and indexed `volume_entries` by root twice. It is not migrated: the store
+    /// is rebuilt from a clean path.
+    @Test func v2StoreIsRejectedWithoutMutation() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        try withDatabase(at: location.path) { db in
+            try execute(db, """
+                CREATE TABLE cas_data (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
+                CREATE TABLE volume_metadata (
+                    root TEXT PRIMARY KEY,
+                    entry_count INTEGER NOT NULL
+                        CHECK (typeof(entry_count) = 'integer' AND entry_count > 0)
+                );
+                CREATE TABLE volume_entries (
+                    root TEXT NOT NULL REFERENCES volume_metadata(root) ON DELETE CASCADE,
+                    cid TEXT NOT NULL REFERENCES cas_data(cid),
+                    PRIMARY KEY (root, cid)
+                );
+                CREATE TABLE retained_roots (scope TEXT NOT NULL, root TEXT NOT NULL, PRIMARY KEY (scope, root));
+                CREATE INDEX idx_ve_cid ON volume_entries(cid);
+                CREATE INDEX idx_ve_root ON volume_entries(root);
+                CREATE INDEX idx_retained_roots_root ON retained_roots(root);
+                INSERT INTO cas_data(cid, data) VALUES('v2-root', X'CAFE');
+                INSERT INTO volume_metadata(root, entry_count) VALUES('v2-root', 1);
+                INSERT INTO volume_entries(root, cid) VALUES('v2-root', 'v2-root');
+                PRAGMA user_version=2;
+                """)
+        }
+        let before = try Data(contentsOf: URL(fileURLWithPath: location.path))
+
+        do {
+            _ = try DiskBroker(path: location.path)
+            Issue.record("v2 schema must fail closed")
+        } catch {
+            #expect(error as? BrokerError == .migrationRequired(found: 2, required: 3))
+        }
+        #expect(try Data(contentsOf: URL(fileURLWithPath: location.path)) == before)
+        try withDatabase(at: location.path) { db throws in
+            #expect(try scalar(db, "PRAGMA user_version") == 2)
+            #expect(try scalar(db, "SELECT COUNT(*) FROM volume_entries WHERE root='v2-root'") == 1)
+            #expect(try scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='idx_ve_root'") == 1)
+            #expect(try scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'counted%'") == 0)
+        }
+    }
+
+    /// v3's b-trees: `volume_metadata` and `counted_markers` are stored in
+    /// their keys, and `volume_entries` has no second index by root.
+    @Test func freshSchemaHasTheBTreesItsLookupsNeed() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        _ = try DiskBroker(path: location.path)
+
+        try withDatabase(at: location.path) { db throws in
+            func names(_ sql: String) -> [String] {
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+                var result: [String] = []
+                while sqlite3_step(stmt) == SQLITE_ROW { result.append(String(cString: sqlite3_column_text(stmt, 0))) }
+                return result
+            }
+            #expect(names("SELECT name FROM sqlite_schema WHERE rootpage > 0 ORDER BY name") == [
+                "cas_data", "counted_markers", "counted_roots",
+                "idx_counted_roots_root", "idx_retained_roots_root", "idx_ve_cid",
+                "retained_roots",
+                "sqlite_autoindex_cas_data_1", "sqlite_autoindex_counted_roots_1",
+                "sqlite_autoindex_retained_roots_1", "sqlite_autoindex_volume_entries_1",
+                "volume_entries", "volume_metadata",
+            ])
+            #expect(names("""
+                SELECT name FROM sqlite_schema WHERE type='table' AND sql LIKE '%WITHOUT ROWID' ORDER BY name
+                """) == ["counted_markers", "volume_metadata"])
+        }
+    }
+
+    /// Traced from whichever connection a read holds.
+    private final class TracedSQL: @unchecked Sendable {
+        private let lock = NSLock()
+        private var traced: [String] = []
+        func append(_ sql: String) { lock.withLock { traced.append(sql) } }
+        var statements: [String] { lock.withLock { traced } }
+    }
+
+    /// Every statement the broker runs, on any connection, seeks a key;
+    /// only the sweep walks a table, the Volume list it is defined over.
+    @Test func everyStatementButTheSweepSeeksAKey() async throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let connection = try SQLiteConnection(path: location.path)
+        let store = CASVolumeStore(connection: connection)
+        let retained = RetainedRootIndex(connection: connection)
+        let counted = CountedRootIndex(connection: connection, retained: retained)
+
+        let traced = TracedSQL()
+        for db in [connection.db] + connection.readers {
+            sqlite3_trace_v2(db, UInt32(SQLITE_TRACE_STMT), { _, context, statement, _ in
+                let traced = Unmanaged<TracedSQL>.fromOpaque(context!).takeUnretainedValue()
+                if let statement, let sql = sqlite3_sql(OpaquePointer(statement)) {
+                    traced.append(String(cString: sql))
+                }
+                return 0
+            }, Unmanaged.passUnretained(traced).toOpaque())
+        }
+
+        func volume(_ name: String, _ members: [String]) throws -> SerializedVolume {
+            let rootData = Data(name.utf8)
+            var entries = [try cid(for: rootData): rootData]
+            for member in members { entries[try cid(for: Data(member.utf8))] = Data(member.utf8) }
+            return SerializedVolume(root: try cid(for: rootData), entries: entries)
+        }
+        let a = try volume("a", ["shared", "a-leaf"]), b = try volume("b", ["shared"])
+        let c = try volume("c", []), d = try volume("d", ["d-leaf"])
+        try await store.storeVolumesLocal([a, b, c, d])
+        try await store.storeVolumesLocal([a])
+        try await retained.advanceRetainedRoots(scope: "s", roots: [a.root, b.root])
+        try await retained.mergeRetainedRoots(scope: "t", roots: [c.root])
+        try await counted.adjustCountedRoots(scope: "n", deltas: [d.root: 1], marker: "m1", expectedMarker: nil)
+        _ = try await counted.countedState(scope: "n")
+        _ = try await counted.countedScopes(prefix: "")
+        _ = try await retained.retainedRoots(scope: "s")
+        _ = try await retained.retainedScopes(prefix: "")
+        #expect(await store.hasVolume(root: a.root))
+        #expect(await store.fetchVolumeLocal(root: b.root) != nil)
+        #expect(await store.fetchDataLocal(cids: Set(a.entries.keys)).count == 3)
+        #expect(try await retained.releaseRetainedRoots(scope: "s", roots: [a.root]) == 1)
+        #expect(try await retained.releaseRetainedScopes(["t"]) == 1)
+        try await counted.adjustCountedRoots(scope: "n", deltas: [d.root: -1], marker: "m2", expectedMarker: "m1")
+        try await store.storeVolumesLocal([d])
+        try await counted.adjustCountedRoots(scope: "n", deltas: [d.root: 1], marker: "m3", expectedMarker: "m2")
+        try await counted.dropCountedScope(scope: "n")
+        #expect(try await retained.sweep() == 0)
+        for db in [connection.db] + connection.readers { sqlite3_trace_v2(db, 0, nil, nil) }
+
+        let statements = Set(traced.statements)
+        #expect(statements.count > 20)
+        var scans: [String] = []
+        for sql in statements {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            #expect(sqlite3_prepare_v2(connection.db, "EXPLAIN QUERY PLAN " + sql, -1, &stmt, nil) == SQLITE_OK, "\(sql)")
+            while let stmt, sqlite3_step(stmt) == SQLITE_ROW {
+                let detail = String(cString: sqlite3_column_text(stmt, 3))
+                // `found` is the scope listing's own recursion, not a table.
+                if detail.hasPrefix("SCAN"), detail != "SCAN found" { scans.append("\(detail): \(sql)") }
+            }
+        }
+        #expect(scans.count == 1, "\(scans)")
+        #expect(scans.allSatisfy { $0.hasPrefix("SCAN volume_metadata: SELECT root FROM volume_metadata") }, "\(scans)")
+    }
+
+    @Test func aRowidTableIsRejected() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        _ = try DiskBroker(path: location.path)
+        try withDatabase(at: location.path) { db in
+            try execute(db, "DROP TABLE counted_markers")
+            try execute(db, "CREATE TABLE counted_markers (scope TEXT PRIMARY KEY, marker TEXT NOT NULL)")
+        }
+
+        #expect(throws: BrokerError.invalidSchema(version: 3)) {
+            _ = try DiskBroker(path: location.path)
+        }
+    }
+
     @Test func futureVersionIsRejectedWithoutMutation() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        try withDatabase(at: location.path) { db in
+            try execute(db, "PRAGMA user_version=4")
+        }
+
+        do {
+            _ = try DiskBroker(path: location.path)
+            Issue.record("future schema must fail closed")
+        } catch {
+            #expect(error as? BrokerError == .migrationRequired(found: 4, required: 3))
+        }
+        try withDatabase(at: location.path) { db in
+            let version = try scalar(db, "PRAGMA user_version")
+            let brokerTables = try scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='cas_data'")
+            #expect(version == 4)
+            #expect(brokerTables == 0)
+        }
+    }
+
+    @Test func stampedV3WithoutV3SchemaIsRejected() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         try withDatabase(at: location.path) { db in
@@ -279,34 +466,13 @@ struct SchemaVersionTests {
 
         do {
             _ = try DiskBroker(path: location.path)
-            Issue.record("future schema must fail closed")
-        } catch {
-            #expect(error as? BrokerError == .migrationRequired(found: 3, required: 2))
-        }
-        try withDatabase(at: location.path) { db in
-            let version = try scalar(db, "PRAGMA user_version")
-            let brokerTables = try scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='cas_data'")
-            #expect(version == 3)
-            #expect(brokerTables == 0)
-        }
-    }
-
-    @Test func stampedV2WithoutV2SchemaIsRejected() throws {
-        let location = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: location.directory) }
-        try withDatabase(at: location.path) { db in
-            try execute(db, "PRAGMA user_version=2")
-        }
-
-        do {
-            _ = try DiskBroker(path: location.path)
             Issue.record("schema stamp without schema must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 2))
+            #expect(error as? BrokerError == .invalidSchema(version: 3))
         }
     }
 
-    @Test func behaviorChangingV2SchemaIsRejected() throws {
+    @Test func behaviorChangingV3SchemaIsRejected() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         do { _ = try DiskBroker(path: location.path) }
@@ -322,9 +488,9 @@ struct SchemaVersionTests {
 
         do {
             _ = try DiskBroker(path: location.path)
-            Issue.record("behavior-changing v2 schema must fail closed")
+            Issue.record("behavior-changing v3 schema must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 2))
+            #expect(error as? BrokerError == .invalidSchema(version: 3))
         }
     }
 
@@ -340,7 +506,7 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("missing canonical index must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 2))
+            #expect(error as? BrokerError == .invalidSchema(version: 3))
         }
     }
 
@@ -356,11 +522,11 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("behavior-changing index must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 2))
+            #expect(error as? BrokerError == .invalidSchema(version: 3))
         }
     }
 
-    @Test func reopeningV2PreservesExistingTables() throws {
+    @Test func reopeningV3PreservesExistingTables() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         _ = try DiskBroker(path: location.path)
@@ -393,7 +559,7 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("incoming foreign keys must not attach behavior to owned tables")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 2))
+            #expect(error as? BrokerError == .invalidSchema(version: 3))
         }
     }
 }

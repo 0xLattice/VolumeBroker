@@ -12,36 +12,6 @@ struct CountedRootIndex {
     let connection: SQLiteConnection
     let retained: RetainedRootIndex
 
-    /// A binary that predates counted roots does not see them, so after a
-    /// rollback its release or sweep may have removed a Volume a scope still
-    /// counts. Such a scope loses its counts and its marker, and its owner
-    /// starts it again; until it does, the Volumes the scope counted are kept
-    /// only if something else retains or counts them. Run once on open, before any other use of the connection.
-    /// The check costs one lookup per counted row and writes nothing; the
-    /// deletes run only when it finds a scope to drop.
-    func dropScopesCountingMissingRoots() throws {
-        let brokenScopes = """
-            SELECT cr.scope FROM counted_roots cr
-            WHERE NOT EXISTS (
-                SELECT 1 FROM volume_metadata vm
-                WHERE vm.root = cr.root AND \(CASVolumeStore.completeVolumePredicate)
-            )
-            """
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(connection.db, "SELECT EXISTS (\(brokenScopes))", -1, &stmt, nil) == SQLITE_OK,
-              let stmt, sqlite3_step(stmt) == SQLITE_ROW else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        guard sqlite3_column_int64(stmt, 0) != 0 else { return }
-        // Markers first: the second statement still finds the same scopes.
-        // Each uncorrelated IN list is built before its statement deletes.
-        try connection.transaction {
-            try connection.exec("DELETE FROM counted_markers WHERE scope IN (\(brokenScopes))")
-            try connection.exec("DELETE FROM counted_roots WHERE scope IN (\(brokenScopes))")
-        }
-    }
-
     func adjustCountedRoots(
         scope: String,
         deltas: [String: Int],

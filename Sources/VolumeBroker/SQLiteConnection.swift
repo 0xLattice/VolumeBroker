@@ -14,7 +14,7 @@ let SQLITE_TRANSIENT_SHIM = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 /// primitives the higher layers build on. Higher layers (CAS store, retained
 /// roots) compose this type and never open SQLite handles directly.
 final class SQLiteConnection: @unchecked Sendable {
-    private static let schemaVersion = 2
+    private static let schemaVersion = 3
 
     /// Reads run concurrently, each on a read connection it holds alone:
     /// a connection has one transaction, so two reads sharing one would
@@ -262,7 +262,6 @@ final class SQLiteConnection: @unchecked Sendable {
         do {
             let foundVersion = try scalarInt(db: db, "PRAGMA user_version")
             if foundVersion == schemaVersion {
-                try createAdditiveSchemaIfMissing(db: db)
                 try validateSchema(db: db)
             } else {
                 guard foundVersion == 0 else {
@@ -292,6 +291,12 @@ final class SQLiteConnection: @unchecked Sendable {
         }
     }
 
+    /// A table whose rows are small and found only by their key is stored
+    /// in that key (`WITHOUT ROWID`): one b-tree, not a rowid table beside
+    /// it. A table with a payload, or with an index that would otherwise
+    /// carry its whole key, keeps its rowid: rows append in order, and the
+    /// random-order keys stay narrow, which writes fewer pages. Each index
+    /// serves a lookup by a column no key starts with.
     private static let tableSchemas: [(name: String, sql: String)] = [
         ("cas_data", """
             CREATE TABLE cas_data (
@@ -304,7 +309,7 @@ final class SQLiteConnection: @unchecked Sendable {
                 root TEXT PRIMARY KEY,
                 entry_count INTEGER NOT NULL
                     CHECK (typeof(entry_count) = 'integer' AND entry_count > 0)
-            )
+            ) WITHOUT ROWID
             """),
         ("volume_entries", """
             CREATE TABLE volume_entries (
@@ -320,19 +325,8 @@ final class SQLiteConnection: @unchecked Sendable {
                 PRIMARY KEY (scope, root)
             )
             """),
-    ]
-
-    private static let indexSchemas: [(name: String, sql: String)] = [
-        ("idx_ve_cid", "CREATE INDEX idx_ve_cid ON volume_entries(cid)"),
-        ("idx_ve_root", "CREATE INDEX idx_ve_root ON volume_entries(root)"),
-        ("idx_retained_roots_root", "CREATE INDEX idx_retained_roots_root ON retained_roots(root)"),
-    ]
-
-    /// Tables added within v2. Opening a v2 store that lacks them creates
-    /// them, at the same version. They hold no foreign key, so a binary that
-    /// predates them still opens the store: its validation accepts any other
-    /// table that holds no foreign key into the tables it owns.
-    private static let additiveTableSchemas: [(name: String, sql: String)] = [
+        // No foreign key into volume_metadata: every reclaim checks
+        // counted_roots before it deletes a Volume.
         ("counted_roots", """
             CREATE TABLE counted_roots (
                 scope TEXT NOT NULL,
@@ -346,32 +340,17 @@ final class SQLiteConnection: @unchecked Sendable {
             CREATE TABLE counted_markers (
                 scope TEXT PRIMARY KEY,
                 marker TEXT NOT NULL
-            )
+            ) WITHOUT ROWID
             """),
     ]
 
-    private static let additiveIndexSchemas: [(name: String, sql: String)] = [
+    private static let indexSchemas: [(name: String, sql: String)] = [
+        ("idx_ve_cid", "CREATE INDEX idx_ve_cid ON volume_entries(cid)"),
+        ("idx_retained_roots_root", "CREATE INDEX idx_retained_roots_root ON retained_roots(root)"),
         ("idx_counted_roots_root", "CREATE INDEX idx_counted_roots_root ON counted_roots(root)"),
     ]
 
-    /// An object of another kind under one of these names is a malformed
-    /// schema, not something to create beside.
-    private static func createAdditiveSchemaIfMissing(db: OpaquePointer) throws {
-        let objects = additiveTableSchemas.map { ("table", $0) } + additiveIndexSchemas.map { ("index", $0) }
-        for (type, object) in objects where schemaSQL(db: db, type: type, name: object.name) == nil {
-            guard try scalarInt(
-                db: db,
-                "SELECT COUNT(*) FROM sqlite_schema WHERE name='\(object.name)' COLLATE NOCASE"
-            ) == 0 else {
-                throw BrokerError.invalidSchema(version: schemaVersion)
-            }
-            try execRaw(db: db, object.sql)
-        }
-    }
-
     private static func validateSchema(db: OpaquePointer) throws {
-        let tableSchemas = tableSchemas + additiveTableSchemas
-        let indexSchemas = indexSchemas + additiveIndexSchemas
         for table in tableSchemas {
             guard let stored = schemaSQL(db: db, type: "table", name: table.name),
                   canonicalSQL(stored) == canonicalSQL(table.sql) else {
@@ -502,7 +481,7 @@ final class SQLiteConnection: @unchecked Sendable {
     }
 
     private static func createTables(db: OpaquePointer) throws {
-        for table in tableSchemas + additiveTableSchemas { try execRaw(db: db, table.sql) }
-        for index in indexSchemas + additiveIndexSchemas { try execRaw(db: db, index.sql) }
+        for table in tableSchemas { try execRaw(db: db, table.sql) }
+        for index in indexSchemas { try execRaw(db: db, index.sql) }
     }
 }

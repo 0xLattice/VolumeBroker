@@ -144,27 +144,27 @@ snapshot: an adjustment computed from those counts passes that marker as
 as `retainedScopes(prefix:)`, and `dropCountedScope(scope:)` deletes a scope's
 counts and marker and reclaims what nothing else keeps.
 
-- The counted tables hold no foreign key, so a binary that predates them still
-  opens the store. That binary's release and sweep do not see counts and may
-  remove a counted Volume. On the next open, a scope that counts a root no
-  longer stored loses its counts and its marker, and its owner starts it again.
-  Until it does, the Volumes that scope counted are kept only if something
-  else retains or counts them.
-
 ## Implementations
 
 - `MemoryBroker` is the in-memory twin with identical retention and counting
   semantics.
-- `DiskBroker` uses SQLite, WAL, foreign keys, and schema v2 validation. With
+- `DiskBroker` uses SQLite, WAL, foreign keys, and schema v3 validation. With
   `synchronous=FULL`, each commit is fsynced to the WAL before it returns, so a
   `store` that returns survives a crash.
 - Every broker is directly usable as Cashew's `VolumeStorer`, `ContentSource`,
   and `Fetcher`.
 
 `DiskBroker` initializes only an empty v0 database. Any other version, including
-v1 (owner/count pins), fails closed with `migrationRequired`; rebuild from a new
-database path. Malformed v2 schemas fail closed. A v2 store without the counted
-tables gets them on open, at the same version.
+v1 (owner/count pins) and v2 (rowid metadata and marker tables, and a second
+index by root on Volume membership), fails closed with
+`migrationRequired`; rebuild from a new database path. Malformed v3 schemas fail
+closed.
+
+In v3, `volume_metadata` and `counted_markers`, whose small rows are found only
+by their keys, are stored in those keys (`WITHOUT ROWID`). The other tables keep
+their rowids, so rows append in order and the random-order indexes stay narrow.
+Each index serves a lookup by a column no key starts with: a CAS row's owners
+by CID, and the scopes that retain or count a root, by root.
 
 ## Boundary
 
