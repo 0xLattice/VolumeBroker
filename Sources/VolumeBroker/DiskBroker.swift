@@ -9,9 +9,25 @@ import Foundation
 ///   - `RetainedRootIndex` — named retained-root sets, release, and sweep.
 ///   - `CountedRootIndex`  — counted roots and their markers.
 ///
-/// Durability: the write connection runs WAL with `synchronous=FULL`, so every
-/// committed transaction is fsynced to the WAL before `COMMIT` returns. A
-/// `store` that returns has survived any later crash; no separate sync exists.
+/// Durability is the opener's choice (`BrokerDurability`). By default the write
+/// connection runs WAL with `synchronous=FULL`, so every committed transaction
+/// is fsynced to the WAL before `COMMIT` returns: a `store` that returns has
+/// survived any later crash. With `.deferred` a commit does not wait for its
+/// sync, and `flush` makes every commit so far durable.
+/// When a `DiskBroker` write is durable.
+///
+/// Either way a write is atomic and writes are ordered: a store opened after
+/// any crash holds a prefix of the writes that returned, each whole.
+public enum BrokerDurability: Sendable, Equatable {
+    /// A write is durable when it returns: every commit waits for its fsync.
+    case everyCommit
+    /// A write does not wait for its fsync. A crash of the process loses
+    /// nothing; a power loss or a kernel crash loses the writes since the
+    /// last `flush` or checkpoint. For a store whose content can be had
+    /// again, where that wait is the cost and the loss is a re-fetch.
+    case deferred
+}
+
 public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
     public let near: (any VolumeBroker)?
     public let far: (any VolumeBroker)?
@@ -24,9 +40,10 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
     public init(
         path: String,
         near: (any VolumeBroker)? = nil,
-        far: (any VolumeBroker)? = nil
+        far: (any VolumeBroker)? = nil,
+        durability: BrokerDurability = .everyCommit
     ) throws {
-        let connection = try SQLiteConnection(path: path)
+        let connection = try SQLiteConnection(path: path, durability: durability)
         self.connection = connection
         self.volumes = CASVolumeStore(connection: connection)
         let retainedRoots = RetainedRootIndex(connection: connection)
@@ -136,6 +153,12 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
 
     public func checkpoint() async {
         await connection.checkpoint()
+    }
+
+    /// Makes every write that has returned durable. Nothing to do, and
+    /// nothing done, unless the broker was opened `.deferred`.
+    public func flush() async throws {
+        try await connection.flush()
     }
 
 }
