@@ -685,17 +685,26 @@ struct DiskBrokerTests {
             previous?.signal()
             for read in reads { await read.value }
         }
+        defer { stop.set() }
         var i = 0
-        while walSize() < 16 << 20 {
+        while walSize() < 16 << 20, i < 400 {
             try await store.storeVolumesLocal([volume(i)])
             i += 1
         }
+        #expect(walSize() >= 16 << 20, "the WAL did not grow under overlapping reads")
         stop.set()
         await chain.value
 
         // No reads now: the next checkpoint completes, and the writes
         // after it restart the WAL.
-        let interval = SQLiteConnection.checkpointFrames * 4096
+        let pageSize = await connection.read { readDb in
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_prepare_v2(readDb, "PRAGMA page_size", -1, &stmt, nil)
+            _ = sqlite3_step(stmt)
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
+        let interval = SQLiteConnection.checkpointFrames * pageSize
         for _ in 0..<40 where walSize() > interval {
             try await store.storeVolumesLocal([volume(i)])
             i += 1

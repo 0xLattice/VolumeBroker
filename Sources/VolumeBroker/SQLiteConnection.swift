@@ -477,7 +477,7 @@ final class SQLiteConnection: @unchecked Sendable {
     /// SQLite's default automatic checkpoint, every this many WAL frames.
     static let checkpointFrames = 1000
 
-    /// When the WAL restarts, its file is cut back to one checkpoint
+    /// When the WAL restarts, its file is cut back to about one checkpoint
     /// interval. While reads overlap without a gap the WAL cannot restart
     /// and grows; without a limit its file then keeps that size for as
     /// long as the store is open, where SQLite's default leaves it
