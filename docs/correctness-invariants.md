@@ -29,7 +29,6 @@ Retention never substitutes for publication.
 | VOLUME-022 | Reads run on a read-only connection of their own, never the write connection: a read is a snapshot of committed state and sees no transaction half done. Opening creates the WAL files that connection needs, and fails if it cannot be had. |
 | VOLUME-023 | A counted adjustment changes one scope's counts and marker in one transaction, and is refused whole on a marker other than the one expected, a count below zero or past `Int.max`, or a root starting to be counted that is not a complete stored Volume (every such root is listed). A count is above zero or absent. `countedState` reads a scope's marker and counts from one snapshot. |
 | VOLUME-024 | A Volume is kept while a scope retains it or counts it. Release, sweep, adjustment and scope drop each remove a Volume only when neither holds it, with the CAS rows that leaves unowned. |
-| VOLUME-025 | The counted tables are added within v2, without foreign keys, so a binary that predates them opens the store. On open, a scope that counts a root that is not a complete stored Volume loses its counts and its marker; the Volumes it counted are then kept only if something else retains or counts them. |
 
 A read never writes, so a database error or a corrupt leaf can never shrink
 what a retained root keeps.

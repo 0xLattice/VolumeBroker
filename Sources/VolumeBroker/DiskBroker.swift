@@ -32,7 +32,6 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
         let retainedRoots = RetainedRootIndex(connection: connection)
         self.retainedRoots = retainedRoots
         self.countedRoots = CountedRootIndex(connection: connection, retained: retainedRoots)
-        try countedRoots.dropScopesCountingMissingRoots()
         self.near = near
         self.far = far
     }

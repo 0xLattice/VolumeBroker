@@ -406,16 +406,6 @@ struct CountedRootsTests {
         }
     }
 
-    private static func scalar(_ db: OpaquePointer, _ sql: String) throws -> Int {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt,
-              sqlite3_step(stmt) == SQLITE_ROW else {
-            throw RawError.sqlite(String(cString: sqlite3_errmsg(db)))
-        }
-        return Int(sqlite3_column_int64(stmt, 0))
-    }
-
     @Test func countsMarkersAndScopesSurviveReopen() async throws {
         let path = Self.path()
         do {
@@ -430,77 +420,6 @@ struct CountedRootsTests {
         #expect(try await reopened.countedScopes(prefix: "x:") == ["x:counted"])
         #expect(try await reopened.sweep() == 0)
         #expect(await reopened.hasVolume(root: Self.cid("a")))
-    }
-
-    /// A store written by a binary that predates counted roots gets the
-    /// tables on open, at the same version, with everything else untouched.
-    @Test func aStoreWithoutTheTablesGetsThemOnOpenAtTheSameVersion() async throws {
-        let path = Self.path()
-        do {
-            let broker = try DiskBroker(path: path)
-            try await broker.storeVolumesLocal([Self.volume("a")])
-            try await broker.advanceRetainedRoots(scope: "r", roots: [Self.cid("a")])
-        }
-        try Self.withDatabase(at: path) { db throws in
-            try Self.execute(db, "DROP INDEX idx_counted_roots_root")
-            try Self.execute(db, "DROP TABLE counted_roots")
-            try Self.execute(db, "DROP TABLE counted_markers")
-            #expect(try Self.scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE '%counted%'") == 0)
-        }
-
-        let reopened = try DiskBroker(path: path)
-        try Self.withDatabase(at: path) { db throws in
-            #expect(try Self.scalar(db, "PRAGMA user_version") == 2)
-            #expect(try Self.scalar(db, """
-                SELECT COUNT(*) FROM sqlite_schema
-                WHERE name IN ('counted_roots', 'counted_markers', 'idx_counted_roots_root')
-                """) == 3)
-        }
-        #expect(try await reopened.retainedRoots(scope: "r") == [Self.cid("a")])
-        try await reopened.adjustCountedRoots(
-            scope: "c", deltas: Self.counts(["a": 1]), marker: "m1", expectedMarker: nil)
-        #expect(try await reopened.countedState(scope: "c").counts == Self.counts(["a": 1]))
-    }
-
-    /// The validation of the binary before counted roots, verbatim: the
-    /// tables it owns, its indexes, and no foreign key from any other table
-    /// into them. A store with counted roots in it passes, so rolling back
-    /// still opens it.
-    @Test func theValidationBeforeCountedRootsAcceptsTheNewTables() async throws {
-        let path = Self.path()
-        do {
-            let broker = try DiskBroker(path: path)
-            try await broker.storeVolumesLocal([Self.volume("a")])
-            try await broker.adjustCountedRoots(
-                scope: "c", deltas: Self.counts(["a": 1]), marker: "m1", expectedMarker: nil)
-        }
-        try Self.withDatabase(at: path) { db throws in
-            let protectedTables = "'cas_data','volume_metadata','volume_entries','retained_roots'"
-            let allowedIndexes = "'idx_ve_cid','idx_ve_root','idx_retained_roots_root'"
-            #expect(try Self.scalar(db, "PRAGMA user_version") == 2)
-            #expect(try Self.scalar(db, """
-                SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name IN (\(protectedTables))
-                """) == 0)
-            #expect(try Self.scalar(db, """
-                SELECT COUNT(*) FROM sqlite_schema
-                WHERE type='index'
-                  AND tbl_name IN (\(protectedTables))
-                  AND sql IS NOT NULL
-                  AND name NOT IN (\(allowedIndexes))
-                """) == 0)
-            #expect(try Self.scalar(db, """
-                SELECT COUNT(*)
-                FROM sqlite_schema AS child
-                JOIN pragma_foreign_key_list(child.name) AS fk
-                WHERE child.type='table'
-                  AND child.name NOT IN (\(protectedTables))
-                  AND fk."table" COLLATE NOCASE IN (\(protectedTables))
-                """) == 0)
-            #expect(try Self.scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0)
-            // No foreign key at all, so none can hold back an older binary's deletes.
-            #expect(try Self.scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_list('counted_roots')") == 0)
-            #expect(try Self.scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_list('counted_markers')") == 0)
-        }
     }
 
     /// A SQL failure late in an adjustment, at the marker write or in the
@@ -558,7 +477,7 @@ struct CountedRootsTests {
             try Self.execute(db, "DROP TABLE counted_markers")
             try Self.execute(db, sql)
         }
-        #expect(throws: BrokerError.invalidSchema(version: 2)) {
+        #expect(throws: BrokerError.invalidSchema(version: 3)) {
             _ = try DiskBroker(path: path)
         }
     }
@@ -570,49 +489,8 @@ struct CountedRootsTests {
             try Self.execute(db, "DROP TABLE counted_markers")
             try Self.execute(db, "CREATE TABLE counted_markers (scope TEXT PRIMARY KEY, marker TEXT)")
         }
-        #expect(throws: BrokerError.invalidSchema(version: 2)) {
+        #expect(throws: BrokerError.invalidSchema(version: 3)) {
             _ = try DiskBroker(path: path)
         }
-    }
-
-    /// After a rollback, the older binary's sweep, which does not see
-    /// counted roots, removes a Volume a scope counts. On the next open that
-    /// scope loses its counts and its marker; every other scope stays.
-    @Test func aScopeCountingARootAnOlderBinaryRemovedIsDroppedOnOpen() async throws {
-        let path = Self.path()
-        do {
-            let broker = try DiskBroker(path: path)
-            try await broker.storeVolumesLocal([
-                Self.volume("gone", ["gone-leaf"]), Self.volume("kept"), Self.volume("both"),
-            ])
-            try await broker.advanceRetainedRoots(scope: "r", roots: [Self.cid("kept"), Self.cid("both")])
-            try await broker.adjustCountedRoots(
-                scope: "broken", deltas: Self.counts(["gone": 1, "both": 1]), marker: "m1", expectedMarker: nil)
-            try await broker.adjustCountedRoots(
-                scope: "fine", deltas: Self.counts(["kept": 1]), marker: "n1", expectedMarker: nil)
-        }
-        // The sweep of the binary before counted roots, verbatim.
-        try Self.withDatabase(at: path) { db throws in
-            try Self.execute(db, "PRAGMA foreign_keys=ON")
-            try Self.execute(db, """
-                BEGIN IMMEDIATE;
-                DELETE FROM volume_metadata WHERE root NOT IN (SELECT root FROM retained_roots);
-                DELETE FROM cas_data WHERE NOT EXISTS (
-                    SELECT 1 FROM volume_entries ve WHERE ve.cid = cas_data.cid);
-                COMMIT;
-                """)
-        }
-
-        let reopened = try DiskBroker(path: path)
-        #expect(await reopened.hasVolume(root: Self.cid("gone")) == false)
-        #expect(try await reopened.countedScopes(prefix: "") == ["fine"])
-        #expect(try await reopened.countedState(scope: "broken").counts == [:])
-        #expect(try await reopened.countedState(scope: "broken").marker == nil)
-        #expect(try await reopened.countedState(scope: "fine").counts == Self.counts(["kept": 1]))
-        #expect(try await reopened.countedState(scope: "fine").marker == "n1")
-        // The dropped scope starts again from no marker.
-        try await reopened.storeVolumesLocal([Self.volume("gone", ["gone-leaf"])])
-        try await reopened.adjustCountedRoots(
-            scope: "broken", deltas: Self.counts(["gone": 1, "both": 1]), marker: "m1", expectedMarker: nil)
     }
 }
