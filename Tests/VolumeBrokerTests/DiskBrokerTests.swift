@@ -615,6 +615,94 @@ struct DiskBrokerTests {
         #expect(late == [volume.root])
     }
 
+    /// A WAL that grew while reads overlapped without a gap is cut back
+    /// when it next restarts. Under a chain of reads, each begun before the
+    /// last ends, the WAL cannot restart and grows past 16 MiB; once the
+    /// reads stop and a checkpoint completes, the next writes restart it
+    /// and its file is back to one checkpoint interval. (macOS's SQLite
+    /// already limits it; elsewhere SQLite's default would keep the
+    /// file at its largest.)
+    @Test func aWALThatGrewUnderOverlappingReadsIsCutBackWhenItRestarts() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DiskBrokerWAL-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("volumes.sqlite").path
+        let connection = try SQLiteConnection(path: path)
+        let store = CASVolumeStore(connection: connection)
+        try await store.storeVolumesLocal([ScopeTests.volume("seed", ["leaf"])])
+        func walSize() -> Int {
+            ((try? FileManager.default.attributesOfItem(atPath: path + "-wal")[.size]) as? Int) ?? 0
+        }
+        func volume(_ i: Int) -> SerializedVolume {
+            var entries: [String: Data] = [:]
+            let rootBytes = Data("wal-root-\(i)".utf8)
+            let root = ScopeTests.cid(for: rootBytes)
+            entries[root] = rootBytes
+            for j in 0..<4 {
+                var leaf = Data(count: 65_536)
+                leaf.withUnsafeMutableBytes { bytes in
+                    for k in stride(from: 0, to: bytes.count, by: 8) {
+                        bytes.storeBytes(of: UInt64(i * 4 + j) &* 0x9E37_79B9_7F4A_7C15 &+ UInt64(k), toByteOffset: k, as: UInt64.self)
+                    }
+                }
+                entries[ScopeTests.cid(for: leaf)] = leaf
+            }
+            return SerializedVolume(root: root, entries: entries)
+        }
+
+        // A chain of reads: each takes a snapshot, and is let go only once
+        // the next has taken its own.
+        final class Stop: @unchecked Sendable {
+            private let lock = NSLock(); private var stopped = false
+            var isSet: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+            func set() { lock.lock(); stopped = true; lock.unlock() }
+        }
+        let stop = Stop()
+        let chain = Task {
+            var previous: DispatchSemaphore?
+            var reads: [Task<Void, Never>] = []
+            while !stop.isSet {
+                let started = DispatchSemaphore(value: 0)
+                let release = DispatchSemaphore(value: 0)
+                reads.append(Task {
+                    await connection.read { readDb in
+                        var stmt: OpaquePointer?
+                        defer { sqlite3_finalize(stmt) }
+                        sqlite3_prepare_v2(readDb, "SELECT cid FROM cas_data", -1, &stmt, nil)
+                        _ = sqlite3_step(stmt)
+                        started.signal()
+                        release.wait()
+                    }
+                })
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.global().async { started.wait(); continuation.resume() }
+                }
+                previous?.signal()
+                previous = release
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+            previous?.signal()
+            for read in reads { await read.value }
+        }
+        var i = 0
+        while walSize() < 16 << 20 {
+            try await store.storeVolumesLocal([volume(i)])
+            i += 1
+        }
+        stop.set()
+        await chain.value
+
+        // No reads now: the next checkpoint completes, and the writes
+        // after it restart the WAL.
+        let interval = SQLiteConnection.checkpointFrames * 4096
+        for _ in 0..<40 where walSize() > interval {
+            try await store.storeVolumesLocal([volume(i)])
+            i += 1
+        }
+        #expect(walSize() <= interval, "the -wal file is \(walSize() / 1_048_576) MiB")
+    }
+
     /// Regression: DiskBroker is shared across multiple ChainNetwork actors.
     /// Without serialising complete write transactions, two actors calling
     /// store(volume:) calls can concurrently pass SQLITE_OPEN_FULLMUTEX's
