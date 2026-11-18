@@ -39,11 +39,9 @@ final class SQLiteConnection: @unchecked Sendable {
 
     /// When a commit is durable (`BrokerDurability`).
     let durability: BrokerDurability
-    private let walPath: String
 
     init(path: String, durability: BrokerDurability = .everyCommit) throws {
         self.durability = durability
-        self.walPath = path + "-wal"
         var handle: OpaquePointer?
         // FULLMUTEX: serialize all SQLite calls on this connection so that
         // the actor's task-to-thread migrations under Swift concurrency cannot
@@ -167,23 +165,22 @@ final class SQLiteConnection: @unchecked Sendable {
     /// Makes every commit that has returned durable. With `.everyCommit`
     /// each already is, and this does nothing.
     ///
-    /// With `.deferred` a commit is appended to the WAL and not synced. What
-    /// a checkpoint has moved into the database file SQLite synced then, so
-    /// what is not yet durable is in the WAL, and syncing that file makes it
-    /// so. It runs on the write queue, after every write queued before it and
-    /// never during a checkpoint, which the committing connection runs there.
+    /// With `.deferred` a commit is appended to the WAL and not synced. One
+    /// commit made with `synchronous=FULL` syncs the WAL, which makes every
+    /// transaction before it durable too (SQLite's authors:
+    /// sqlite.org/forum/forumpost/a05b8374fc). A commit that writes nothing
+    /// syncs nothing, so this one rewrites the schema version with the value
+    /// it holds. It runs on the write queue, after every write queued before
+    /// it.
     func flush() async throws {
         guard durability == .deferred else { return }
-        try await write { [walPath] in
-            let descriptor = open(walPath, O_RDONLY)
-            guard descriptor >= 0 else {
-                // No WAL file: nothing is waiting in one.
-                if errno == ENOENT { return }
-                throw BrokerError.sqlFailed("WAL not opened to sync: \(String(cString: strerror(errno)))")
-            }
-            defer { close(descriptor) }
-            guard fsync(descriptor) == 0 else {
-                throw BrokerError.sqlFailed("WAL not synced: \(String(cString: strerror(errno)))")
+        try await write { [self] in
+            try exec("PRAGMA synchronous=FULL")
+            // Left FULL if this fails: slower, never weaker.
+            defer { try? exec("PRAGMA synchronous=NORMAL") }
+            try transaction {
+                let version = try Self.scalarInt(db: db, "PRAGMA user_version")
+                try exec("PRAGMA user_version=\(version)")
             }
         }
     }

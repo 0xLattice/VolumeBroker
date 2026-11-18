@@ -64,6 +64,46 @@ struct DurabilityTests {
         try await broker.flush()
     }
 
+    /// What SQLite is asked to sync, counted where it asks: a deferred commit
+    /// syncs nothing, and a flush syncs the WAL, which is what makes the
+    /// commits before it durable.
+    @Test func aFlushSyncsTheWALAndADeferredCommitDoesNot() async throws {
+        SyncCountingVFS.install()
+        let (directory, path) = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wal = directory.lastPathComponent + "/volumes.sqlite-wal"
+        let broker = try DiskBroker(path: path, durability: .deferred)
+        let opened = SyncCountingVFS.syncs(ofFileEndingWith: wal)
+        // The first write to a WAL syncs its header, once; no commit after it
+        // syncs anything.
+        try await broker.storeVolumesLocal([volume("deferred-first")])
+        let started = SyncCountingVFS.syncs(ofFileEndingWith: wal)
+        #expect(started <= opened + 1)
+        for index in 0..<20 { try await broker.storeVolumesLocal([volume("deferred-\(index)")]) }
+        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) == started, "a deferred commit waits for no sync")
+        try await broker.flush()
+        let flushed = SyncCountingVFS.syncs(ofFileEndingWith: wal)
+        #expect(flushed == started + 1, "a flush syncs the WAL, once")
+        // The flush leaves the broker deferred.
+        try await broker.storeVolumesLocal([volume("after-the-flush")])
+        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) == flushed)
+    }
+
+    @Test func anEveryCommitBrokerSyncsTheWALAtEachCommit() async throws {
+        SyncCountingVFS.install()
+        let (directory, path) = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let wal = directory.lastPathComponent + "/volumes.sqlite-wal"
+        let broker = try DiskBroker(path: path)
+        let opened = SyncCountingVFS.syncs(ofFileEndingWith: wal)
+        for index in 0..<5 { try await broker.storeVolumesLocal([volume("synced-\(index)")]) }
+        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) >= opened + 5)
+        // Nothing is waiting, so a flush asks for no sync.
+        let before = SyncCountingVFS.syncs(ofFileEndingWith: wal)
+        try await broker.flush()
+        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) == before)
+    }
+
     @Test func flushingAnEveryCommitBrokerDoesNothing() async throws {
         let (directory, path) = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: directory) }
