@@ -471,6 +471,20 @@ final class SQLiteConnection: @unchecked Sendable {
         try execRaw(db: db, "PRAGMA cache_size=-65536")
         try execRaw(db: db, "PRAGMA mmap_size=268435456")
         try execRaw(db: db, "PRAGMA temp_store=MEMORY")
+        try configureCheckpoints(db: db)
+    }
+
+    /// SQLite's default automatic checkpoint, every this many WAL frames.
+    static let checkpointFrames = 1000
+
+    /// When the WAL restarts, its file is cut back to about one checkpoint
+    /// interval. While reads overlap without a gap the WAL cannot restart
+    /// and grows; without a limit its file then keeps that size for as
+    /// long as the store is open, where SQLite's default leaves it
+    /// unbounded (macOS's own build already limits it).
+    private static func configureCheckpoints(db: OpaquePointer) throws {
+        let pageSize = try scalarInt(db: db, "PRAGMA page_size")
+        try execRaw(db: db, "PRAGMA journal_size_limit=\(checkpointFrames * pageSize)")
     }
 
     private static func enableForeignKeys(db: OpaquePointer) throws {
