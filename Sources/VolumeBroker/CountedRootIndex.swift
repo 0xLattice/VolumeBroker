@@ -130,10 +130,10 @@ struct CountedRootIndex {
     /// written with.
     func countedState(scope: String) async throws -> (marker: String?, counts: [String: Int]) {
         guard !scope.isEmpty, !scope.utf8.contains(0) else { return (nil, [:]) }
-        return try await connection.read {
+        return try await connection.read { readDb in
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
-            let db = connection.readDb
+            let db = readDb
             let sql = """
                 SELECT NULL, marker FROM counted_markers WHERE scope=?1
                 UNION ALL
@@ -174,9 +174,9 @@ struct CountedRootIndex {
     /// work is in the scopes from `prefix` on. Names compare as bytes.
     func countedScopes(prefix: String) async throws -> [String] {
         guard !prefix.utf8.contains(0) else { return [] }
-        return try await connection.read {
+        return try await connection.read { readDb in
             try textColumn(
-                db: connection.readDb,
+                db: readDb,
                 """
                 SELECT scope FROM counted_markers
                 WHERE scope >= ?1

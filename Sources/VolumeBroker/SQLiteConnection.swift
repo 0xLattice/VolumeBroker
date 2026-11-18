@@ -9,24 +9,33 @@ let SQLITE_TRANSIENT_SHIM = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 /// Low-level SQLite connection layer.
 ///
-/// Owns the write and read connections, PRAGMA/schema setup, the read/write
-/// dispatch queues that serialise SQL access, and the raw `exec`/`execBind`
+/// Owns the write and read connections, PRAGMA/schema setup, the serial
+/// write queue and the concurrent read queue, and the raw `exec`/`execBind`
 /// primitives the higher layers build on. Higher layers (CAS store, retained
 /// roots) compose this type and never open SQLite handles directly.
 final class SQLiteConnection: @unchecked Sendable {
     private static let schemaVersion = 2
 
-    /// Serial: a connection has one transaction, so a read started while
-    /// another read's statement is still stepping would join that read's
-    /// snapshot and miss commits made since. One read at a time, each in a
+    /// Reads run concurrently, each on a read connection it holds alone:
+    /// a connection has one transaction, so two reads sharing one would
+    /// share a snapshot, and the later would miss commits made since the
+    /// earlier began. One connection per read in flight, each read in a
     /// snapshot of its own, sees every commit that returned before it.
-    private let readQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.read", qos: .utility)
+    private let readQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.read", qos: .utility, attributes: .concurrent)
     private let writeQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.write", qos: .utility)
 
     /// Write connection — SQLITE_OPEN_FULLMUTEX serialises all SQL calls.
     let db: OpaquePointer
-    /// Separate read-only WAL connection — reads alongside writes.
-    let readDb: OpaquePointer
+    /// Read-only WAL connections, a fixed few: a cheap read waits only
+    /// while every one of them is held by a long read. Each opens its own
+    /// database and `-wal` descriptors and shares the `-shm`, so a few cost
+    /// little.
+    static let readerCount = 4
+    let readers: [OpaquePointer]
+    /// The readers not held by a read, and one permit per reader.
+    private var freeReaders: [OpaquePointer]
+    private let freeReadersLock = NSLock()
+    private let readerPermits = DispatchSemaphore(value: readerCount)
 
     init(path: String) throws {
         var handle: OpaquePointer?
@@ -57,20 +66,27 @@ final class SQLiteConnection: @unchecked Sendable {
         // store reopened: one empty write transaction creates them. There is
         // no falling back to the write connection: a read there would see a
         // transaction half done.
-        var rhandle: OpaquePointer?
+        var opened: [OpaquePointer] = []
         do {
             try Self.execRaw(db: handle, "BEGIN IMMEDIATE; COMMIT")
             let rflags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
-            guard sqlite3_open_v2(path, &rhandle, rflags, nil) == SQLITE_OK, let opened = rhandle else {
-                throw BrokerError.openFailed(
-                    rhandle.map { String(cString: sqlite3_errmsg($0)) } ?? "no read connection")
+            for _ in 0..<Self.readerCount {
+                var rhandle: OpaquePointer?
+                guard sqlite3_open_v2(path, &rhandle, rflags, nil) == SQLITE_OK, let reader = rhandle else {
+                    let message = rhandle.map { String(cString: sqlite3_errmsg($0)) } ?? "no read connection"
+                    if let rhandle { sqlite3_close(rhandle) }
+                    throw BrokerError.openFailed(message)
+                }
+                opened.append(reader)
+                try Self.enableForeignKeys(db: reader)
+                try Self.execRaw(db: reader, "PRAGMA busy_timeout=5000")
+                // The 16 MiB the one read connection had, shared among them.
+                try Self.execRaw(db: reader, "PRAGMA cache_size=-\(16384 / Self.readerCount)")
             }
-            try Self.enableForeignKeys(db: opened)
-            try Self.execRaw(db: opened, "PRAGMA busy_timeout=5000")
-            try Self.execRaw(db: opened, "PRAGMA cache_size=-16384")
-            self.readDb = opened
+            self.readers = opened
+            self.freeReaders = opened
         } catch {
-            if let rhandle { sqlite3_close(rhandle) }
+            for reader in opened { sqlite3_close(reader) }
             sqlite3_close(handle)
             throw error
         }
@@ -79,32 +95,48 @@ final class SQLiteConnection: @unchecked Sendable {
     deinit {
         // A connection with a statement left unfinalized does not close.
         for statement in statements.values { sqlite3_finalize(statement) }
-        sqlite3_close(readDb)
+        for reader in readers { sqlite3_close(reader) }
         sqlite3_close(db)
     }
 
     // MARK: - Serialised access
 
-    /// Run a read on the serial read queue against the read-only connection.
-    func read<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+    /// Run a read on the read queue, on a read connection it holds alone
+    /// until `body` returns. Waits while every reader is held.
+    func read<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) -> T) async -> T {
         await withCheckedContinuation { continuation in
-            readQueue.async {
-                continuation.resume(returning: body())
+            readQueue.async { [self] in
+                continuation.resume(returning: withReader(body))
             }
         }
     }
 
-    /// Run a throwing read on the serial read queue.
-    func read<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+    /// Run a throwing read on the read queue, on a read connection it holds
+    /// alone until `body` returns.
+    func read<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
-            readQueue.async {
+            readQueue.async { [self] in
                 do {
-                    continuation.resume(returning: try body())
+                    continuation.resume(returning: try withReader(body))
                 } catch {
                     continuation.resume(throwing: error)
                 }
             }
         }
+    }
+
+    private func withReader<T>(_ body: (OpaquePointer) throws -> T) rethrows -> T {
+        readerPermits.wait()
+        freeReadersLock.lock()
+        let reader = freeReaders.removeLast()
+        freeReadersLock.unlock()
+        defer {
+            freeReadersLock.lock()
+            freeReaders.append(reader)
+            freeReadersLock.unlock()
+            readerPermits.signal()
+        }
+        return try body(reader)
     }
 
     /// Run a write on the serial write queue against the write connection.

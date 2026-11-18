@@ -193,7 +193,7 @@ struct RetainedRootIndex {
     func retainedScopes(prefix: String) async throws -> [String] {
         // No scope's name holds a NUL, so none starts with such a prefix.
         guard !prefix.utf8.contains(0) else { return [] }
-        return try await connection.read {
+        return try await connection.read { readDb in
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             let starts = "substr(CAST(scope AS BLOB), 1, length(CAST(?1 AS BLOB))) = CAST(?1 AS BLOB)"
@@ -206,10 +206,10 @@ struct RetainedRootIndex {
                 )
                 SELECT scope FROM found WHERE scope IS NOT NULL AND \(starts)
                 """
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
+            guard sqlite3_prepare_v2(readDb, sql, -1, &stmt, nil) == SQLITE_OK,
                   let stmt,
                   sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
-                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(readDb)))
             }
             var result: [String] = []
             while true {
@@ -217,13 +217,13 @@ struct RetainedRootIndex {
                 case SQLITE_ROW:
                     guard sqlite3_column_type(stmt, 0) == SQLITE_TEXT,
                           let ptr = sqlite3_column_text(stmt, 0) else {
-                        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(readDb)))
                     }
                     result.append(String(cString: ptr))
                 case SQLITE_DONE:
                     return result
                 default:
-                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(readDb)))
                 }
             }
         }
@@ -231,16 +231,16 @@ struct RetainedRootIndex {
 
     func retainedRoots(scope: String) async throws -> [String] {
         guard !scope.isEmpty, !scope.utf8.contains(0) else { return [] }
-        return try await connection.read {
+        return try await connection.read { readDb in
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             let sql = "SELECT root FROM retained_roots WHERE scope=?1 ORDER BY root"
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
+            guard sqlite3_prepare_v2(readDb, sql, -1, &stmt, nil) == SQLITE_OK,
                   let stmt else {
-                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(readDb)))
             }
             guard sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM) == SQLITE_OK else {
-                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(readDb)))
             }
             var result: [String] = []
             while true {
@@ -248,13 +248,13 @@ struct RetainedRootIndex {
                 case SQLITE_ROW:
                     guard sqlite3_column_type(stmt, 0) == SQLITE_TEXT,
                           let ptr = sqlite3_column_text(stmt, 0) else {
-                        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(readDb)))
                     }
                     result.append(String(cString: ptr))
                 case SQLITE_DONE:
                     return result
                 default:
-                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.readDb)))
+                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(readDb)))
                 }
             }
         }

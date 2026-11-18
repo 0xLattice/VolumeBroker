@@ -671,13 +671,13 @@ struct ScopeTests {
         let path = NSTemporaryDirectory() + "vb_scopeprobe_conn_\(UUID().uuidString).sqlite"
         do {
             let connection = try SQLiteConnection(path: path)
-            #expect(connection.readDb != connection.db, "fresh store")
+            #expect(!connection.readers.contains(connection.db), "fresh store")
             let store = CASVolumeStore(connection: connection)
             try await store.storeVolumesLocal([Self.volume("one")])
         }
         do {
             let connection = try SQLiteConnection(path: path)
-            #expect(connection.readDb != connection.db, "reopened store")
+            #expect(!connection.readers.contains(connection.db), "reopened store")
         }
     }
 

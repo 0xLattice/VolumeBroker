@@ -64,10 +64,10 @@ final class VolumeIntegrityTests: XCTestCase {
     }
 
     private func assertHealthy(_ connection: SQLiteConnection) async throws {
-        let result = try await connection.read {
+        let result = try await connection.read { readDb in
             (
-                try Self.scalarText(connection.readDb, "PRAGMA integrity_check"),
-                try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM pragma_foreign_key_check")
+                try Self.scalarText(readDb, "PRAGMA integrity_check"),
+                try Self.scalarInt(readDb, "SELECT COUNT(*) FROM pragma_foreign_key_check")
             )
         }
         XCTAssertEqual(result.0, "ok")
@@ -555,9 +555,9 @@ final class VolumeIntegrityTests: XCTestCase {
                 }
             }
 
-            let rowCounts = try await connection.read {
+            let rowCounts = try await connection.read { readDb in
                 try ["volume_metadata", "cas_data", "volume_entries"].map {
-                    try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM \($0)")
+                    try Self.scalarInt(readDb, "SELECT COUNT(*) FROM \($0)")
                 }
             }
             XCTAssertEqual(rowCounts, [0, 0, 0])
@@ -565,9 +565,9 @@ final class VolumeIntegrityTests: XCTestCase {
         }
 
         let reopened = try SQLiteConnection(path: path)
-        let reopenedCounts = try await reopened.read {
+        let reopenedCounts = try await reopened.read { readDb in
             try ["volume_metadata", "cas_data", "volume_entries"].map {
-                try Self.scalarInt(reopened.readDb, "SELECT COUNT(*) FROM \($0)")
+                try Self.scalarInt(readDb, "SELECT COUNT(*) FROM \($0)")
             }
         }
         XCTAssertEqual(reopenedCounts, [0, 0, 0])
@@ -630,9 +630,9 @@ final class VolumeIntegrityTests: XCTestCase {
             XCTAssertEqual(child.status, 86, "\(phase.rawValue): \(child.output)")
 
             let reopened = try SQLiteConnection(path: path)
-            let counts = try await reopened.read {
+            let counts = try await reopened.read { readDb in
                 try ["volume_metadata", "cas_data", "volume_entries"].map {
-                    try Self.scalarInt(reopened.readDb, "SELECT COUNT(*) FROM \($0)")
+                    try Self.scalarInt(readDb, "SELECT COUNT(*) FROM \($0)")
                 }
             }
             let oldState = [0, 0, 0]
@@ -771,11 +771,11 @@ final class VolumeIntegrityTests: XCTestCase {
             XCTAssertEqual(batch, [root: Data("root".utf8), child: damaged])
             XCTAssertTrue(present)
 
-            let preserved = try await connection.read {
+            let preserved = try await connection.read { readDb in
                 (
-                    try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM volume_metadata"),
-                    try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM volume_entries"),
-                    try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM cas_data")
+                    try Self.scalarInt(readDb, "SELECT COUNT(*) FROM volume_metadata"),
+                    try Self.scalarInt(readDb, "SELECT COUNT(*) FROM volume_entries"),
+                    try Self.scalarInt(readDb, "SELECT COUNT(*) FROM cas_data")
                 )
             }
             XCTAssertEqual(preserved.0, 1)

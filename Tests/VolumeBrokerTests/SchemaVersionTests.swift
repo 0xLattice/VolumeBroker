@@ -111,9 +111,9 @@ struct SchemaVersionTests {
         let connection = try SQLiteConnection(path: location.path)
 
         let writeForeignKeys = try scalar(connection.db, "PRAGMA foreign_keys")
-        let readForeignKeys = try scalar(connection.readDb, "PRAGMA foreign_keys")
+        let readForeignKeys = try connection.readers.map { try scalar($0, "PRAGMA foreign_keys") }
         #expect(writeForeignKeys == 1)
-        #expect(readForeignKeys == 1)
+        #expect(readForeignKeys == Array(repeating: 1, count: SQLiteConnection.readerCount))
     }
 
     @Test func writeConnectionUsesWALAndFullSynchronous() throws {
