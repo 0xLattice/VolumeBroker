@@ -2,16 +2,13 @@ import Testing
 import Foundation
 import CID
 import Multihash
-#if canImport(SQLite3)
-import SQLite3
-#else
-import VolumeBrokerSQLite
-#endif
 @testable import VolumeBroker
 
-/// When a write is durable is the opener's choice. Either way a write is
-/// atomic and writes are ordered; what differs is whether a commit waits for
-/// its fsync.
+/// When a write is durable is the opener's choice. What an operator finds of
+/// it: a deferred store reads and flushes as any other, a store opens in
+/// either mode whatever wrote it, a process that dies loses nothing it
+/// committed, and after a power cut (`PowerLossDisk`) a store holds what was
+/// flushed, whole, and opens.
 @Suite("Durability")
 struct DurabilityTests {
     private func temporaryDatabase() throws -> (directory: URL, path: String) {
@@ -28,28 +25,6 @@ struct DurabilityTests {
         return SerializedVolume(root: root, entries: [root: data])
     }
 
-    private func synchronous(_ connection: SQLiteConnection) -> Int32 {
-        var statement: OpaquePointer?
-        sqlite3_prepare_v2(connection.db, "PRAGMA synchronous", -1, &statement, nil)
-        defer { sqlite3_finalize(statement) }
-        return sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int(statement, 0) : -1
-    }
-
-    @Test func everyCommitIsTheDefaultAndSyncsEachCommit() throws {
-        let (directory, path) = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let connection = try SQLiteConnection(path: path)
-        #expect(connection.durability == .everyCommit)
-        #expect(synchronous(connection) == 2)
-    }
-
-    @Test func deferredCommitsDoNotWaitForTheirSync() throws {
-        let (directory, path) = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let connection = try SQLiteConnection(path: path, durability: .deferred)
-        #expect(synchronous(connection) == 1)
-    }
-
     @Test func aDeferredBrokerStoresReadsAndFlushes() async throws {
         let (directory, path) = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -62,56 +37,6 @@ struct DurabilityTests {
         // After a checkpoint the WAL holds nothing; a flush is still fine.
         await broker.checkpoint()
         try await broker.flush()
-    }
-
-    /// What SQLite is asked to sync, counted where it asks: a deferred commit
-    /// syncs nothing, and a flush syncs the WAL, which is what makes the
-    /// commits before it durable.
-    @Test func aFlushSyncsTheWALAndADeferredCommitDoesNot() async throws {
-        SyncCountingVFS.install()
-        let (directory, path) = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let wal = directory.lastPathComponent + "/volumes.sqlite-wal"
-        let broker = try DiskBroker(path: path, durability: .deferred)
-        let opened = SyncCountingVFS.syncs(ofFileEndingWith: wal)
-        // The first write to a WAL syncs its header, once; no commit after it
-        // syncs anything.
-        try await broker.storeVolumesLocal([volume("deferred-first")])
-        let started = SyncCountingVFS.syncs(ofFileEndingWith: wal)
-        #expect(started <= opened + 1)
-        for index in 0..<20 { try await broker.storeVolumesLocal([volume("deferred-\(index)")]) }
-        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) == started, "a deferred commit waits for no sync")
-        try await broker.flush()
-        let flushed = SyncCountingVFS.syncs(ofFileEndingWith: wal)
-        #expect(flushed == started + 1, "a flush syncs the WAL, once")
-        // The flush leaves the broker deferred.
-        try await broker.storeVolumesLocal([volume("after-the-flush")])
-        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) == flushed)
-    }
-
-    @Test func anEveryCommitBrokerSyncsTheWALAtEachCommit() async throws {
-        SyncCountingVFS.install()
-        let (directory, path) = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let wal = directory.lastPathComponent + "/volumes.sqlite-wal"
-        let broker = try DiskBroker(path: path)
-        let opened = SyncCountingVFS.syncs(ofFileEndingWith: wal)
-        for index in 0..<5 { try await broker.storeVolumesLocal([volume("synced-\(index)")]) }
-        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) >= opened + 5)
-        // Nothing is waiting, so a flush asks for no sync.
-        let before = SyncCountingVFS.syncs(ofFileEndingWith: wal)
-        try await broker.flush()
-        #expect(SyncCountingVFS.syncs(ofFileEndingWith: wal) == before)
-    }
-
-    @Test func flushingAnEveryCommitBrokerDoesNothing() async throws {
-        let (directory, path) = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let broker = try DiskBroker(path: path)
-        let stored = volume("every-commit")
-        try await broker.storeVolumesLocal([stored])
-        try await broker.flush()
-        #expect(await broker.fetchVolumeLocal(root: stored.root)?.entries == stored.entries)
     }
 
     /// The mode belongs to the opener, not the file: a store written one way
@@ -154,5 +79,77 @@ struct DurabilityTests {
         for stored in volumes {
             #expect(await reopened.fetchVolumeLocal(root: stored.root)?.entries == stored.entries)
         }
+    }
+
+    // MARK: - After a power cut
+
+    /// Stores `count` Volumes one at a time, in order, and returns them.
+    private func store(_ count: Int, named name: String, in broker: DiskBroker) async throws -> [SerializedVolume] {
+        var stored: [SerializedVolume] = []
+        for index in 0..<count {
+            let next = volume("\(name)-\(index)")
+            try await broker.storeVolumesLocal([next])
+            stored.append(next)
+        }
+        return stored
+    }
+
+    /// What a reopened store holds of `volumes`, in the order they were
+    /// written: true where the Volume is there, whole.
+    private func held(_ volumes: [SerializedVolume], in broker: DiskBroker) async -> [Bool] {
+        var held: [Bool] = []
+        for volume in volumes {
+            let found = await broker.fetchVolumeLocal(root: volume.root)
+            #expect(found == nil || found?.entries == volume.entries, "a Volume is whole or absent")
+            held.append(found != nil)
+        }
+        return held
+    }
+
+    @Test func afterAPowerCutADeferredStoreHoldsEverythingWrittenBeforeItsFlush() async throws {
+        PowerLossDisk.install()
+        let (directory, path) = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let broker = try DiskBroker(path: path, durability: .deferred, vfs: PowerLossDisk.vfsName)
+        let flushed = try await store(40, named: "flushed", in: broker)
+        try await broker.flush()
+        let later = try await store(40, named: "later", in: broker)
+
+        let after = try PowerLossDisk.afterOutage(of: path, into: directory.appendingPathComponent("after"))
+        let reopened = try DiskBroker(path: after)
+        #expect(await held(flushed, in: reopened) == Array(repeating: true, count: 40), "flushed, so still there")
+        // What came after the flush may be gone, never out of order: a
+        // Volume is there only if every one written before it is.
+        let kept = await held(later, in: reopened)
+        #expect(kept == kept.sorted { $0 && !$1 }, "the store holds a prefix of what was written")
+    }
+
+    @Test func afterAPowerCutADeferredStoreNeverFlushedOpensWithAPrefixOfItsWrites() async throws {
+        PowerLossDisk.install()
+        let (directory, path) = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let broker = try DiskBroker(path: path, durability: .deferred, vfs: PowerLossDisk.vfsName)
+        let written = try await store(60, named: "unflushed", in: broker)
+
+        let after = try PowerLossDisk.afterOutage(of: path, into: directory.appendingPathComponent("after"))
+        let reopened = try DiskBroker(path: after)
+        let kept = await held(written, in: reopened)
+        #expect(kept == kept.sorted { $0 && !$1 }, "the store holds a prefix of what was written")
+        #expect(kept.contains(false), "nothing was flushed: the power cut lost the newest writes")
+        // And it is a working store: it takes the lost writes again.
+        try await reopened.storeVolumesLocal(written.map { $0 })
+        #expect(await held(written, in: reopened) == Array(repeating: true, count: 60))
+    }
+
+    @Test func afterAPowerCutAnEveryCommitStoreHoldsEveryWriteThatReturned() async throws {
+        PowerLossDisk.install()
+        let (directory, path) = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let broker = try DiskBroker(path: path, durability: .everyCommit, vfs: PowerLossDisk.vfsName)
+        let written = try await store(40, named: "synced", in: broker)
+
+        let after = try PowerLossDisk.afterOutage(of: path, into: directory.appendingPathComponent("after"))
+        let reopened = try DiskBroker(path: after)
+        #expect(await held(written, in: reopened) == Array(repeating: true, count: 40))
     }
 }

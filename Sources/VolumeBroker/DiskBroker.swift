@@ -43,13 +43,25 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
     private let retainedRoots: RetainedRootIndex
     private let countedRoots: CountedRootIndex
 
-    public init(
+    public convenience init(
         path: String,
         near: (any VolumeBroker)? = nil,
         far: (any VolumeBroker)? = nil,
         durability: BrokerDurability = .everyCommit
     ) throws {
-        let connection = try SQLiteConnection(path: path, durability: durability)
+        try self.init(path: path, near: near, far: far, durability: durability, vfs: nil)
+    }
+
+    /// As the public initializer, through the SQLite VFS `vfs` names: a test
+    /// opens a store on one that stands in for the disk.
+    init(
+        path: String,
+        near: (any VolumeBroker)? = nil,
+        far: (any VolumeBroker)? = nil,
+        durability: BrokerDurability,
+        vfs: String?
+    ) throws {
+        let connection = try SQLiteConnection(path: path, durability: durability, vfs: vfs)
         self.connection = connection
         self.volumes = CASVolumeStore(connection: connection)
         let retainedRoots = RetainedRootIndex(connection: connection)
