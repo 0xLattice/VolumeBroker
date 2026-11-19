@@ -153,8 +153,10 @@ counts and marker and reclaims what nothing else keeps.
   fsynced to the WAL before it returns, so a `store` that returns survives a
   crash. Opened `durability: .deferred`, a commit does not wait for its fsync:
   writes stay atomic and ordered, a crash of the process loses nothing, and a
-  power loss loses the writes since the last `flush()` or checkpoint. That
-  suits a store whose content can be fetched again.
+  power loss loses the writes since the last `flush()`. That suits a store
+  whose content can be fetched again. The caller flushes before another store
+  makes durable anything that names this content, and before acknowledging a
+  retained or counted root it promised.
 - Every broker is directly usable as Cashew's `VolumeStorer`, `ContentSource`,
   and `Fetcher`.
 

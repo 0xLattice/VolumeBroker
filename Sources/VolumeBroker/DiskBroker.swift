@@ -1,5 +1,25 @@
 import Foundation
 
+/// When a `DiskBroker` write is durable.
+///
+/// Either way a write is atomic and writes are ordered: a store opened after
+/// any crash holds a prefix of the committed writes, each whole.
+public enum BrokerDurability: Sendable, Equatable {
+    /// A write is durable when it returns: every commit waits for its fsync.
+    case everyCommit
+    /// A write does not wait for its fsync. A crash of the process loses
+    /// nothing; a power loss or a kernel crash loses the writes since the
+    /// last `flush`. For a store whose content can be had again, where that
+    /// wait is the cost and the loss is a re-fetch.
+    ///
+    /// The caller keeps two orders. Anything another store makes durable
+    /// that names this broker's content comes after a `flush`, so it never
+    /// names content a power loss took. And a write the operator relies on
+    /// (a retained or counted root it was promised) is acknowledged after a
+    /// `flush`.
+    case deferred
+}
+
 /// SQLite-backed `VolumeBroker`.
 ///
 /// `DiskBroker` composes the layered storage components and delegates to them;
@@ -14,20 +34,6 @@ import Foundation
 /// is fsynced to the WAL before `COMMIT` returns: a `store` that returns has
 /// survived any later crash. With `.deferred` a commit does not wait for its
 /// sync, and `flush` makes every commit so far durable.
-/// When a `DiskBroker` write is durable.
-///
-/// Either way a write is atomic and writes are ordered: a store opened after
-/// any crash holds a prefix of the writes that returned, each whole.
-public enum BrokerDurability: Sendable, Equatable {
-    /// A write is durable when it returns: every commit waits for its fsync.
-    case everyCommit
-    /// A write does not wait for its fsync. A crash of the process loses
-    /// nothing; a power loss or a kernel crash loses the writes since the
-    /// last `flush` or checkpoint. For a store whose content can be had
-    /// again, where that wait is the cost and the loss is a re-fetch.
-    case deferred
-}
-
 public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
     public let near: (any VolumeBroker)?
     public let far: (any VolumeBroker)?
@@ -156,7 +162,10 @@ public final class DiskBroker: @unchecked Sendable, CountedRootBroker {
     }
 
     /// Makes every write that has returned durable. Nothing to do, and
-    /// nothing done, unless the broker was opened `.deferred`.
+    /// nothing done, unless the broker was opened `.deferred`. A flush that
+    /// throws leaves those writes' durability unknown; a later flush that
+    /// returns does not prove them durable, since a failed fsync may have
+    /// dropped them. Treat a throw as a storage fault.
     public func flush() async throws {
         try await connection.flush()
     }
