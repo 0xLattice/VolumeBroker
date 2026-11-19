@@ -40,10 +40,14 @@ final class SQLiteConnection: @unchecked Sendable {
     /// When a commit is durable (`BrokerDurability`).
     let durability: BrokerDurability
 
-    /// `vfs` names the SQLite VFS every connection opens through; nil is the
-    /// default one. Tests name one that stands in for the disk.
-    init(path: String, durability: BrokerDurability = .everyCommit, vfs: String? = nil) throws {
+    /// The SQLite VFS a connection opened in this task opens through; nil
+    /// is the default one. A test binds one that stands in for the disk, and
+    /// opens its store as any caller does.
+    @TaskLocal static var vfs: String?
+
+    init(path: String, durability: BrokerDurability = .everyCommit) throws {
         self.durability = durability
+        let vfs = Self.vfs
         var handle: OpaquePointer?
         // FULLMUTEX: serialize all SQLite calls on this connection so that
         // the actor's task-to-thread migrations under Swift concurrency cannot
