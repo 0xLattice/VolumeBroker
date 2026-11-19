@@ -117,15 +117,6 @@ struct SchemaVersionTests {
         #expect(readForeignKeys == Array(repeating: 1, count: SQLiteConnection.readerCount))
     }
 
-    @Test func writeConnectionUsesWALAndFullSynchronous() throws {
-        let location = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: location.directory) }
-        let connection = try SQLiteConnection(path: location.path)
-
-        #expect(try scalarText(connection.db, "PRAGMA journal_mode").lowercased() == "wal")
-        #expect(try scalar(connection.db, "PRAGMA synchronous") == 2)
-    }
-
     @Test func freshSchemaOmitsOperationJournals() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }

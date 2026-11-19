@@ -40,14 +40,20 @@ final class SQLiteConnection: @unchecked Sendable {
     /// When a commit is durable (`BrokerDurability`).
     let durability: BrokerDurability
 
+    /// The SQLite VFS a connection opened in this task opens through; nil
+    /// is the default one. A test binds one that stands in for the disk, and
+    /// opens its store as any caller does.
+    @TaskLocal static var vfs: String?
+
     init(path: String, durability: BrokerDurability = .everyCommit) throws {
         self.durability = durability
+        let vfs = Self.vfs
         var handle: OpaquePointer?
         // FULLMUTEX: serialize all SQLite calls on this connection so that
         // the actor's task-to-thread migrations under Swift concurrency cannot
         // race with deinit's sqlite3_close, which runs outside actor isolation.
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
-        guard sqlite3_open_v2(path, &handle, flags, nil) == SQLITE_OK, let handle else {
+        guard sqlite3_open_v2(path, &handle, flags, vfs) == SQLITE_OK, let handle else {
             let msg = handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
             if let handle { sqlite3_close(handle) }
             throw BrokerError.openFailed(msg)
@@ -76,7 +82,7 @@ final class SQLiteConnection: @unchecked Sendable {
             let rflags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
             for _ in 0..<Self.readerCount {
                 var rhandle: OpaquePointer?
-                guard sqlite3_open_v2(path, &rhandle, rflags, nil) == SQLITE_OK, let reader = rhandle else {
+                guard sqlite3_open_v2(path, &rhandle, rflags, vfs) == SQLITE_OK, let reader = rhandle else {
                     let message = rhandle.map { String(cString: sqlite3_errmsg($0)) } ?? "no read connection"
                     if let rhandle { sqlite3_close(rhandle) }
                     throw BrokerError.openFailed(message)
