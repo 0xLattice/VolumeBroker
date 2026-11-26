@@ -1,195 +1,98 @@
 # VolumeBroker
 
-Atomic, Volume-granular content-addressed storage for
-[Cashew](https://github.com/0xLattice/cashew).
+VolumeBroker is a Swift library that stores content-addressed data one
+[Volume](https://lattice.build/docs/protocol/cashew/) at a time: a root CID
+and the exact `(CID, bytes)` entries published with it, committed as one
+unit. In Lattice it is the node's content store. The node keeps one
+VolumeBroker database per hosted chain, holding block bodies, state and the
+chain's rules, and uses retention to decide what stays on disk.
 
-A `SerializedVolume` is one root CID plus the exact `(CID, bytes)` entries
-published with it. VolumeBroker stores that set as one unit. It never walks DAG
-links; the only relationship it knows is Volume membership. It knows nothing
-about chains.
+VolumeBroker never walks DAG links. The only relationship it knows is which
+entries belong to which Volume. It knows nothing about chains.
 
-## Contract
-
-- A Volume is visible only after its complete entry set commits, CID-valid as
-  checked on its way in.
-- Bytes are hashed once, on their way in. A `SerializedVolume` is validated
-  when stored; a `ValidatedVolume` is stored without hashing again, for bytes
-  the caller already checked or made itself. Reads return the bytes as stored.
-- Valid CID bytes and Volume membership are immutable.
-- Reads may fall through `local -> near -> far` for what a tier lacks; a
-  tier's damaged bytes are served, not fallen through. Writes target one
-  broker.
-- A retained or counted root keeps its own Volume and nothing nested under it;
-  `sweep` removes every Volume no scope retains or counts.
-- Equal CIDs are deduplicated within each broker tier.
-
-One cascade is one storage domain. Use separate brokers or database paths when
-data must be isolated.
-
-## Usage
+## Quick example
 
 ```swift
 import VolumeBroker
 
 let disk = try DiskBroker(path: "/var/lib/my-app/volumes.sqlite")
 let memory = MemoryBroker(near: disk)
-```
 
-Reads now try memory and then disk. Stores remain explicit.
-
-Let Cashew produce valid Volume boundaries:
-
-```swift
-// Store the root and one selected nested Volume.
+// Store: cashew produces the Volume boundaries, the broker commits each one.
 try await root.store(
     paths: [["accounts", "alice"]: .targeted],
     storer: disk
 )
-```
 
-`.recursive` selects every nested Volume below a path. Each emitted Volume is
-still an independent storage and retention unit. Cashew submits one Volume per
-storer callback; callers that already hold an all-or-none batch can use
-`storeVolumesLocal` to commit it in one transaction.
+// Retain: a stored Volume is kept only while a scope names its root.
+try await disk.advanceRetainedRoots(scope: "canonical", roots: [root.rawCID])
 
-Resolve through the read cascade:
-
-```swift
+// Read: memory first, then disk.
 let resolved = try await unresolvedRoot.resolveRecursive(source: memory)
-```
 
-`VolumeBroker.fetch(_:)` resolves each Cashew frontier with one batched read per
-storage tier.
-
-## Retention
-
-A scope is a name; a retained root is a complete stored Volume root. Advancing
-a scope atomically replaces its root set and refuses any root that is not a
-complete stored Volume, so a retained root never names content the broker lacks:
-
-```swift
-try await disk.advanceRetainedRoots(scope: "canonical", roots: [stateRoot])
-```
-
-`mergeRetainedRoots` adds roots without replacing the set. Replacing a scope
-with the same set and merging roots already in it are naturally idempotent.
-
-A Volume is kept if a scope retains or counts its root (see Counted roots),
-and only then. Retaining a root does not keep a Volume nested under it: a
-caller that wants one kept retains its root too.
-
-```swift
+// Reclaim: remove every Volume no scope retains or counts.
 let removed = try await disk.sweep()
 ```
 
-`sweep` removes every Volume no scope retains, then every CAS row no surviving
-Volume owns, in one transaction. It has no grace window: content stored but not
-yet retained is swept, and a later advance naming it is refused. Callers store,
-then advance, and sweep only between their own commits.
+Store, then retain, then sweep. A sweep between a store and its retain
+removes what was stored. `storeVolumesLocal(_:retaining:)` stores and retains
+in one transaction.
 
-```swift
-let removed = try await disk.releaseRetainedRoots(scope: "canonical", roots: [oldRoot])
-```
+## Key concepts
 
-`releaseRetainedRoots` takes roots out of a scope and removes those of them no
-scope retains, with the CAS rows that leaves unowned. Its work is in the roots
-named, not in the size of the store, and it touches nothing else.
+| Concept | What it is |
+| --- | --- |
+| Volume | A root CID plus the entries published with it, defined by [cashew](https://lattice.build/docs/protocol/cashew/). The unit VolumeBroker stores, reads and removes. |
+| Broker | One store. `DiskBroker` is SQLite; `MemoryBroker` is its in-memory twin with identical retention and counting semantics. |
+| Read cascade | A broker may link a `near` and a `far` broker. A read falls through `local -> near -> far` for what a tier lacks. Writes target one broker. |
+| Retained root | A stored Volume root that a named scope keeps. Advancing a scope replaces its root set. |
+| Counted root | A root with a count in a scope, changed together with the scope's marker in one transaction. |
+| Sweep | Removes every Volume no scope retains or counts, and the bytes that leaves unowned. |
 
-`retainedScopes(prefix:)` lists the scopes that retain something. A caller
-that keeps one scope per thing it holds uses it to find the ones it no longer
-has a reason for, and `releaseRetainedScopes` lets go of several of them,
-everything each retains, in one transaction.
+Retaining or counting a root keeps that Volume and nothing nested under it. A
+caller that wants a nested Volume kept retains its root too.
 
-- A scope's name is its bytes. A prefix is a prefix of bytes, the listing is
-  in byte order, and a name with a NUL is refused.
-- A listing is one snapshot of committed state, as every read is: reads run
-  on a connection of their own.
-- A scope is let go of with `releaseRetainedRoots`, naming what it retains.
-  Emptying one with `advanceRetainedRoots(scope:roots: [])` removes it from
-  the listing and reclaims nothing: its Volumes stay until a sweep, or a
-  release that names them.
-- Storing and then retaining are two commits. A release or a sweep between
-  them removes what was stored, and the retain is then refused whole with
-  `missingRetainedRoot`: store again and retry. `storeVolumesLocal(_:retaining:)`
-  makes them one: the batch is stored and each scope's roots merged in one
-  transaction, or nothing changes.
+Every broker is directly usable as cashew's `VolumeStorer`, `ContentSource`
+and `Fetcher`.
 
-### Counted roots
-
-A `CountedRootBroker` also keeps, per scope, a count for each root and one
-marker, and changes them together:
-
-```swift
-try await disk.adjustCountedRoots(
-    scope: "state", deltas: [newNode: 1, oldNode: -1],
-    marker: "block-12", expectedMarker: "block-11")
-```
-
-The adjustment is one transaction and is refused whole, with nothing changed,
-when the scope's marker is not `expectedMarker` (`nil` for none,
-`countedMarkerMismatch`), when a count would go below zero (`negativeCount`)
-or past `Int.max` (`countedRootOverflow`), or when a root would start being
-counted and is not a complete stored Volume (`countedRootsMissing`, listing
-every such root). Zero deltas are ignored. A
-root whose count reaches zero leaves the scope and, if no scope counts or
-retains it, is removed with the CAS rows that leaves unowned. The marker lets
-a caller keep its own cursor in the same commit as its counts.
-
-A Volume is kept while any scope counts it or any scope retains it: release,
-sweep, adjustment and drop all check both. Counted scopes are a namespace of
-their own. `countedState(scope:)` reads one scope's marker and counts from one
-snapshot: an adjustment computed from those counts passes that marker as
-`expectedMarker`, so it applies only to the counts it was computed from.
-`countedScopes(prefix:)` lists the scopes with a marker by the same byte rules
-as `retainedScopes(prefix:)`, and `dropCountedScope(scope:)` deletes a scope's
-counts and marker and reclaims what nothing else keeps.
-
-## Implementations
-
-- `MemoryBroker` is the in-memory twin with identical retention and counting
-  semantics.
-- `DiskBroker` uses SQLite, WAL, foreign keys, and schema v3 validation. By
-  default (`durability: .everyCommit`, `synchronous=FULL`) each commit is
-  fsynced to the WAL before it returns, so a `store` that returns survives a
-  crash. Opened `durability: .deferred`, a commit does not wait for its fsync:
-  writes stay atomic and ordered, a crash of the process loses nothing, and a
-  power loss loses the writes since the last `flush()`. That suits a store
-  whose content can be fetched again. The caller flushes before another store
-  makes durable anything that names this content, and before acknowledging a
-  retained or counted root it promised.
-- Every broker is directly usable as Cashew's `VolumeStorer`, `ContentSource`,
-  and `Fetcher`.
-
-`DiskBroker` initializes only an empty v0 database. Any other version, including
-v1 (owner/count pins) and v2 (rowid metadata and marker tables, and a second
-index by root on Volume membership), fails closed with
-`migrationRequired`; rebuild from a new database path. Malformed v3 schemas fail
-closed.
-
-In v3, `volume_metadata` and `counted_markers`, whose small rows are found only
-by their keys, are stored in those keys (`WITHOUT ROWID`). The other tables keep
-their rowids, so rows append in order and the random-order indexes stay narrow.
-Each index serves a lookup by a column no key starts with: a CAS row's owners
-by CID, and the scopes that retain or count a root, by root.
+By default a `DiskBroker` store that returns survives a crash.
+[VolumeBroker architecture](docs/architecture.md#durability) describes the
+deferred mode.
 
 ## Boundary
 
 | VolumeBroker owns | The caller owns |
 | --- | --- |
 | Volume validation and atomic publication | DAG traversal and Volume selection |
-| Local CAS, read cascading, and the sweep | Storage placement and domain isolation |
+| Local CAS, read cascading and the sweep | Storage placement and domain isolation |
 | Retained-root sets and counted roots | Which roots are retained or counted, and when to sweep |
-| Storage integrity | Application state, canonicity, and consensus |
+| Storage integrity | Application state, canonicity and consensus |
 
-See [correctness invariants](docs/correctness-invariants.md) for the review
-contract. This README and the correctness invariants are published at
-[lattice.build/docs](https://lattice.build/docs/protocol/volumebroker/).
+One cascade is one storage domain. Use separate brokers or database paths
+when data must be isolated.
 
-## Requirements
+## Documentation
 
-- Swift 6.0+
-- macOS 13+ or iOS 16+
-- Cashew 4.0.1
+Published at
+[lattice.build/docs](https://lattice.build/docs/protocol/volumebroker/) from
+the files below.
+
+| Page | What it covers |
+| --- | --- |
+| [VolumeBroker architecture](docs/architecture.md) | The storage contract, storing and reading, retention, counted roots, durability and the SQLite schema. |
+| [VolumeBroker invariants](docs/correctness-invariants.md) | The rules a change to VolumeBroker must keep, each with its ID and the code and tests that enforce it. |
+
+## Install
+
+```swift
+.package(url: "https://github.com/0xLattice/VolumeBroker.git", from: "10.4.1")
+```
+
+| Requirement | Version |
+| --- | --- |
+| Swift | 6.0+ |
+| Platforms | macOS 13+ or iOS 16+ |
+| cashew | 5.0.7 (pinned exactly in `Package.swift`) |
 
 ```sh
 swift build
